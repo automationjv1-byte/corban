@@ -1,0 +1,33 @@
+# =====================================================================
+# Ajustes del servidor para Hostinger (y cualquier hosting con Apache o LiteSpeed).
+# Es el equivalente del archivo _headers que usa Netlify. Netlify ignora este archivo,
+# y Hostinger ignora _headers: pueden convivir en la carpeta sin problema.
+# =====================================================================
+
+# 1. Siempre por HTTPS (conexión segura, el candado del navegador).
+#    Requiere tener activado el certificado SSL en el panel de Hostinger.
+RewriteEngine On
+RewriteCond %{HTTPS} off
+RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [L,R=301]
+
+<IfModule mod_headers.c>
+  # 2. Seguridad básica
+  Header set X-Content-Type-Options "nosniff"
+  Header set Referrer-Policy "strict-origin-when-cross-origin"
+
+  # 3. El código del sitio se revisa siempre: así un cambio publicado se ve enseguida
+  #    y nadie queda con una versión vieja guardada en su celular.
+  <FilesMatch "\.(html|js|css)$">
+    Header set Cache-Control "no-cache"
+  </FilesMatch>
+
+  # 4. Las fotos se guardan 1 día en el celular del visitante (cargan más rápido).
+  <FilesMatch "\.(webp|jpg|jpeg|png|svg)$">
+    Header set Cache-Control "public, max-age=86400"
+  </FilesMatch>
+
+  # 5. La tipografía no cambia: se guarda un año.
+  <FilesMatch "\.woff2$">
+    Header set Cache-Control "public, max-age=31536000"
+  </FilesMatch>
+</IfModule>
