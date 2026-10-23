@@ -1,0 +1,5 @@
+# Redirecciones de Netlify (este archivo no se ve en el sitio; otros hostings lo ignoran).
+# Una sola dirección para Google: las direcciones viejas van a la página principal.
+# /index.html/ era la dirección del WordPress anterior que Google tenía guardada.
+/index.html   /   301!
+/catalogo/*   /:splat   301!

@@ -1,0 +1,466 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>Prueba del sitio (simulación)</title>
+<style>
+  body { font: 15px/1.5 system-ui, sans-serif; margin: 24px; }
+  .ok { color: #13703a; } .mal { color: #b3261e; font-weight: bold; }
+  iframe { width: 375px; height: 700px; border: 1px solid #ccc; }
+</style>
+</head>
+<body>
+<h1>Prueba del sitio (simulación local)</h1>
+<p>Carga el sitio real (<code>sitio/</code>) con una conexión simulada: un catálogo con etiquetas HTML maliciosas,
+envíos que fallan y que funcionan, la página de cada producto, el aviso de WhatsApp y un catálogo de 200 productos.
+No manda nada real.</p>
+<ul id="resultados"></ul>
+<iframe id="marco" title="Sitio en prueba"></iframe>
+<script>
+const lista = document.getElementById('resultados');
+let fallas = 0;
+function chequear(nombre, ok, detalle) {
+  const li = document.createElement('li');
+  li.className = ok ? 'ok' : 'mal';
+  li.textContent = (ok ? '✔ ' : '✘ ') + nombre + (ok || detalle === undefined ? '' : ' — ' + detalle);
+  lista.appendChild(li);
+  if (!ok) fallas++;
+}
+const espera = ms => new Promise(r => setTimeout(r, ms));
+// Espera hasta que se cumpla una condición (o hasta 3 s): las respuestas simuladas llegan en orden variable.
+async function hasta(condicion, ms = 3000) { for (let i = 0; i < ms / 100 && !condicion(); i++) await espera(100); }
+
+function producto(codigo, extra) {
+  return Object.assign({ codigo, nombre: 'Producto ' + codigo, categoria: 'A', descripcion: 'Descripción de ' + codigo,
+    foto: codigo + '.webp', alt: 'Foto de ' + codigo, destacado: false, estado: 'disponible', precio: 1000,
+    cuotas: [{ cuotas: 3, valor: 333.33 }] }, extra || {});
+}
+function catalogo(productos) {
+  return {
+    ok: true, actualizado: new Date().toISOString(),
+    negocio: { nombre_negocio: 'Negocio <b>Prueba</b>', whatsapp: '5491100000000', mail_pedidos: 'prueba@ejemplo.com',
+      texto_aviso: '<i>aviso</i>', formas_de_pago: 'Efectivo', mostrar_precios: true },
+    categorias: [...new Set(productos.map(p => p.categoria))],
+    financiacion: [{ cuotas: 3, recargo: 0 }],
+    productos,
+  };
+}
+
+// Carga el sitio en el marco y espera a que muestre el catálogo.
+async function cargarSitio(consulta) {
+  const marco = document.getElementById('marco');
+  marco.src = 'sitio-falso.html' + (consulta || '');
+  await new Promise(r => marco.addEventListener('load', r, { once: true }));
+  const w = marco.contentWindow;
+  for (let i = 0; i < 50 && !(w.__listo && w.document.querySelector('#grilla .tarjeta h2')); i++) await espera(100);
+  return { w, d: w.document, $: id => w.document.getElementById(id) };
+}
+
+async function correr() {
+  // El navegador puede tener guardada una versión vieja de la página de prueba: se pide la actual.
+  await fetch('sitio-falso.html', { cache: 'reload' });
+  // ---------- 1. Escapado, fotos, envío del formulario ----------
+  window.__CATALOGO = catalogo([
+    producto('X1', { nombre: '<img src=x onerror="parent.__xss=1">Hackeado', descripcion: '<b>negrita</b><script>parent.__xss=2<\/script>',
+      descripcion_larga: 'Primer párrafo.\nSegundo párrafo <b>con etiqueta</b>.', foto: 'no-existe.webp', alt: '' }),
+    producto('X2', { nombre: 'Segundo producto' }),
+  ]);
+  window.__modoPost = 'falla';
+  localStorage.removeItem('catalogo_mayorista_v1');
+  localStorage.removeItem('catalogo_cache_v1');
+  localStorage.setItem('catalogo_pedido_v1', JSON.stringify({ X1: 2 }));
+  let { w, d, $ } = await cargarSitio();
+
+  const h2 = d.querySelector('#grilla h2');
+  chequear('el código pegado en la planilla NO se ejecuta', window.__xss === undefined, String(window.__xss));
+  chequear('se ve como texto', h2.textContent.startsWith('<img') && d.querySelector('.descripcion').textContent.includes('<script>'));
+  chequear('no se crean etiquetas reales', d.querySelectorAll('#grilla h2 img, .descripcion b, .descripcion script, #aviso i, #nombre-negocio b').length === 0);
+  chequear('aviso y nombre del negocio (o su logo) como texto', $('aviso').textContent === '<i>aviso</i>' && (d.querySelector('#nombre-negocio img') ? d.querySelector('#nombre-negocio img').alt === 'Negocio <b>Prueba</b>' : $('nombre-negocio').textContent === 'Negocio <b>Prueba</b>'));
+  chequear('falta de texto de foto → aviso en consola', w.__avisos.some(a => a.includes('X1')), JSON.stringify(w.__avisos));
+  for (let i = 0; i < 30 && !d.querySelector('#grilla img').src.endsWith('sin-foto.svg'); i++) await espera(100);
+  chequear('foto que no existe → se reemplaza por "sin foto"', d.querySelector('#grilla img').src.endsWith('sin-foto.svg'), d.querySelector('#grilla img').src);
+  chequear('texto alternativo nunca vacío (usa el nombre)', d.querySelector('#grilla img').alt.length > 0);
+
+  $('abrir-pedido').click();
+  $('mostrar-formulario').click();
+  $('f-nombre').value = 'Prueba';
+  $('f-telefono').value = '1122334455';
+  $('enviar-formulario').click();
+  await espera(100);
+  chequear('sin marcar el consentimiento no se envía, y se explica por qué', w.__posts.length === 0 && !$('e-consentimiento').hidden && d.activeElement === $('f-consentimiento'), $('e-consentimiento').textContent);
+  $('f-consentimiento').checked = true;
+  $('enviar-formulario').click();
+  await espera(200);
+  const post = w.__posts[0];
+  chequear('el envío NO lleva cabeceras (evita la verificación previa que Apps Script no responde)', post && post.opciones.headers === undefined && typeof post.opciones.body === 'string');
+  const cuerpo = JSON.parse(post.opciones.body);
+  chequear('manda códigos y cantidades, no precios', JSON.stringify(cuerpo.items) === '[{"codigo":"X1","cantidad":2}]' && cuerpo.origen && cuerpo.sitio_web === '', post.opciones.body);
+  chequear('manda que el cliente dio su consentimiento', cuerpo.consentimiento === true);
+  chequear('si falla, muestra el error con el WhatsApp como salida', !$('error-envio').hidden && d.querySelector('#error-envio a').href.startsWith('https://wa.me/5491100000000?text='));
+  chequear('el WhatsApp del error lleva el pedido y el nombre', decodeURIComponent(d.querySelector('#error-envio a').href).includes('2 × ') && decodeURIComponent(d.querySelector('#error-envio a').href).includes('Nombre: Prueba'));
+  chequear('se puede reintentar', !$('enviar-formulario').disabled);
+
+  // ---------- 2. Aviso de WhatsApp a la planilla ----------
+  // Se frena la navegación a WhatsApp (sería otra pestaña) pero el sitio procesa el clic igual.
+  d.addEventListener('click', e => { if (e.target.id === 'enviar-whatsapp') e.preventDefault(); }, true);
+  const hrefAntes = decodeURIComponent($('enviar-whatsapp').href);
+  const ref = (hrefAntes.match(/Ref\. (W-[A-Z0-9]+)/) || [])[1];
+  chequear('el mensaje de WhatsApp lleva una referencia', !!ref, hrefAntes);
+  $('enviar-whatsapp').click();
+  const beacon = w.__beacons[0];
+  const aviso = beacon && JSON.parse(beacon.cuerpo);
+  chequear('al tocar WhatsApp se avisa a la planilla, sin cabeceras', aviso && aviso.tipo === 'whatsapp' && typeof beacon.cuerpo === 'string', beacon && beacon.cuerpo);
+  chequear('el aviso lleva la MISMA referencia que el mensaje y el pedido', aviso && aviso.ref === ref && JSON.stringify(aviso.items) === '[{"codigo":"X1","cantidad":2}]');
+  d.querySelector('#lineas .cantidad button[aria-label^="Agregar"]').click();
+  const refNueva = (decodeURIComponent($('enviar-whatsapp').href).match(/Ref\. (W-[A-Z0-9]+)/) || [])[1];
+  chequear('si cambia el pedido, cambia la referencia', refNueva && refNueva !== ref);
+
+  // Envío del formulario que funciona
+  window.__modoPost = 'ok';
+  $('enviar-formulario').click();
+  await espera(200);
+  chequear('al enviar, el formulario se oculta y queda la confirmación', $('formulario').hidden && $('pedido-contenido').hidden && !$('confirmacion').hidden);
+  chequear('la confirmación muestra el número de pedido', $('confirmacion-texto').textContent.includes('42'));
+  chequear('el pedido se vacía (no se puede mandar dos veces)', $('contador').textContent === '0' && w.localStorage.getItem('catalogo_pedido_v1') === '{}');
+  $('otro-pedido').click();
+  chequear('"Hacer otro pedido" cierra el panel', !$('panel-pedido').open);
+
+  // ---------- 3. Página individual de un producto ----------
+  const enlace = d.querySelector('#grilla .tarjeta:nth-child(2) h2 a');
+  chequear('el nombre de cada producto es un enlace ?p=CÓDIGO', enlace && enlace.getAttribute('href').endsWith('?p=X2'), enlace && enlace.getAttribute('href'));
+  enlace.click();
+  await espera(100);
+  chequear('al tocarlo se abre la página del producto', $('ficha').open && $('ficha-titulo').textContent === 'Segundo producto');
+  chequear('la dirección cambia a ?p=X2 (se puede copiar y compartir)', w.location.search === '?p=X2', w.location.search);
+  chequear('el título de la pestaña es el del producto', w.document.title.startsWith('Segundo producto'), w.document.title);
+  chequear('el foco va al botón de cerrar', d.activeElement === $('cerrar-ficha'));
+  d.querySelector('#ficha .accion button').click();
+  chequear('"Agregar" en la página del producto suma al pedido', $('contador').textContent === '1');
+  chequear('…y actualiza también la tarjeta del catálogo', !!d.querySelector('#grilla .tarjeta:nth-child(2) .cantidad'));
+  chequear('aparece "Ver tu pedido (1)"', !$('ficha-ver-pedido').hidden && $('ficha-ver-pedido').textContent.includes('(1)'));
+  const consulta = decodeURIComponent(d.querySelector('.ficha-compartir a').href);
+  chequear('"Consultar por WhatsApp" lleva el producto y su enlace', consulta.includes('Segundo producto (X2)') && consulta.includes('?p=X2'), consulta);
+  w.history.back();
+  await espera(300);
+  chequear('el botón "atrás" del navegador cierra la página del producto', !$('ficha').open && w.location.search === '', w.location.search);
+  chequear('al cerrar, el foco vuelve al producto', d.activeElement === enlace);
+
+  d.querySelector('#grilla .tarjeta:nth-child(1) h2 a').click();
+  await espera(100);
+  const parrafos = [...d.querySelectorAll('#ficha .ficha-texto')].map(p => p.textContent);
+  chequear('la descripción larga se ve en párrafos, como texto', parrafos.length === 2 && parrafos[1].includes('<b>') && !d.querySelector('#ficha .ficha-texto b'), JSON.stringify(parrafos));
+  $('cerrar-ficha').click();
+  await espera(300);
+  chequear('cerrar con ✕ también limpia la dirección', !$('ficha').open && w.location.search === '', w.location.search);
+
+  // Enlace directo (alguien recibe el enlace por WhatsApp y lo abre)
+  ({ w, d, $ } = await cargarSitio('?p=X2'));
+  await espera(200);
+  chequear('un enlace ?p=X2 abre directo la página de ese producto', $('ficha').open && $('ficha-titulo').textContent === 'Segundo producto');
+  $('cerrar-ficha').click();
+  await espera(200);
+  chequear('al cerrarla se queda en el catálogo, sin salir del sitio', !$('ficha').open && w.location.pathname.endsWith('sitio-falso.html') && w.location.search === '');
+  ({ w, d, $ } = await cargarSitio('?p=NO-EXISTE'));
+  await espera(500);
+  chequear('un enlace a un producto que ya no está → aviso, y el catálogo se ve igual', !$('ficha').open && /ya no está disponible/.test($('estado').textContent), $('estado').textContent);
+
+  // ---------- 4. Catálogo de 200 productos ----------
+  const muchos = Array.from({ length: 200 }, (_, i) => producto('P' + String(i + 1).padStart(3, '0'), {
+    categoria: 'Cat ' + (i % 8 + 1), destacado: i % 25 === 0, estado: i % 17 === 0 ? 'sin_stock' : 'disponible',
+    descripcion: 'Descripción de ejemplo del producto número ' + (i + 1) + ', con algo de texto para que pese como uno real.',
+  }));
+  window.__CATALOGO = catalogo(muchos);
+  const tamano = new Blob([JSON.stringify(window.__CATALOGO)]).size;
+  localStorage.removeItem('catalogo_cache_v1');
+  localStorage.setItem('catalogo_pedido_v1', '{}');
+  const t0 = performance.now();
+  ({ w, d, $ } = await cargarSitio());
+  const ms = Math.round(performance.now() - t0);
+  chequear(`200 productos: el catálogo pesa ${Math.round(tamano / 1024)} KB (la caché de Google acepta hasta 100 KB por pedazo, y se guarda en pedazos)`, tamano < 400 * 1024);
+  chequear(`200 productos: se muestran los primeros 24 (cargó en ${ms} ms, con 300 ms de conexión simulada)`, d.querySelectorAll('#grilla .tarjeta').length === 24 && $('estado').textContent === '200 productos', $('estado').textContent);
+  chequear('200 productos: solo la primera foto carga de entrada', d.querySelectorAll('#grilla img[loading="eager"]').length === 1);
+  $('ver-mas').click();
+  chequear('"Ver más" suma 24 (48 en total) y dice cuántos quedan', d.querySelectorAll('#grilla .tarjeta').length === 48 && $('ver-mas').textContent.includes('152'), $('ver-mas').textContent);
+  const buscador = $('buscador');
+  buscador.value = 'P187';
+  buscador.dispatchEvent(new w.Event('input'));
+  await espera(300);
+  chequear('el buscador encuentra un producto del final de la lista', d.querySelectorAll('#grilla .tarjeta').length === 1 && d.querySelector('#grilla h2').textContent === 'Producto P187');
+  const anchoMax = Math.max(...[...d.querySelectorAll('body *')].filter(e => !e.closest('.filtros')).map(e => e.getBoundingClientRect().right));
+  chequear('sin desbordes a 375 px', anchoMax <= w.innerWidth + 1, anchoMax + ' / ' + w.innerWidth);
+
+  // ---------- 5. Orden por precio y barra lateral ----------
+  window.__CATALOGO = catalogo([
+    producto('A1', { precio: 500, categoria: 'Uno' }),
+    producto('A2', { precio: 3000, categoria: 'Dos', destacado: true }),
+    producto('A3', { precio: 1500, categoria: 'Uno' }),
+  ]);
+  window.__CATALOGO.negocio.texto_aviso = 'Primer aviso | Segundo aviso | Tercer aviso';
+  window.__CATALOGO.paginas = [
+    { clave: 'quienes-somos', menu: 'Quiénes somos', titulo: 'Quiénes somos', texto: 'Primer párrafo con <b>etiqueta</b>.\nMisma línea siguiente.\n\nSegundo párrafo: https://ejemplo.com/ruta.\n\n- Punto uno\n- Punto dos' },
+    { clave: 'preguntas-frecuentes', menu: 'Preguntas', titulo: 'Preguntas frecuentes', texto: '## ¿Primera?\nRespuesta uno.\n\n## ¿Segunda?\nRespuesta dos.' },
+    { clave: 'contacto', menu: 'Contacto', titulo: 'Contacto', texto: 'Lunes a viernes.' },
+  ];
+  localStorage.removeItem('catalogo_cache_v1');
+  ({ w, d, $ } = await cargarSitio());
+  const avisos = [...d.querySelectorAll('#aviso .aviso-mensaje')];
+  chequear('varios avisos separados por | → franja rotativa, empieza por el primero', avisos.length === 3 && avisos[0].classList.contains('activo') && $('aviso').classList.contains('aviso-rotativo'), avisos.map(a => a.textContent).join('|'));
+  await espera((w.CONFIG_SITIO.segundosPorAviso || 7) * 1000 + 300);
+  chequear('después de unos segundos pasa al siguiente aviso (el anterior sale por la izquierda)', avisos[1].classList.contains('activo') && avisos[0].classList.contains('saliendo') && !avisos[0].classList.contains('activo'));
+  const codigos = () => [...d.querySelectorAll('#grilla .tarjeta h2')].map(h => h.textContent.replace('Producto ', ''));
+  chequear('orden por defecto: destacados primero', codigos()[0] === 'A2', codigos().join());
+  $('orden').value = 'precio-asc'; $('orden').dispatchEvent(new w.Event('change'));
+  chequear('"Menor precio" ordena de menor a mayor', codigos().join() === 'A1,A3,A2', codigos().join());
+  $('orden').value = 'precio-desc'; $('orden').dispatchEvent(new w.Event('change'));
+  chequear('"Mayor precio" ordena de mayor a menor', codigos().join() === 'A2,A3,A1', codigos().join());
+  chequear('el botón "Filtros y orden" muestra cuántos filtros hay aplicados (1)', !$('filtros-activos').hidden && $('filtros-activos').textContent === '1');
+  chequear('en el celular la barra lateral empieza cerrada', !$('filtros-panel').open && getComputedStyle($('abrir-filtros')).display !== 'none');
+  $('abrir-filtros').click();
+  chequear('"Filtros y orden" la abre como panel', $('filtros-panel').open && $('filtros-panel').matches(':modal'));
+  const botonesCat = [...d.querySelectorAll('#filtros .filtro')];
+  chequear('las categorías muestran cuántos productos tienen', botonesCat.map(b => b.textContent).join('|') === 'Todos3|Uno2|Dos1', botonesCat.map(b => b.textContent).join('|'));
+  botonesCat[1].click();
+  chequear('el botón de abajo dice cuántos productos se van a ver', $('aplicar-filtros').textContent === 'Ver 2 productos', $('aplicar-filtros').textContent);
+  $('aplicar-filtros').click();
+  chequear('"Ver 2 productos" cierra el panel y muestra el resultado', !$('filtros-panel').open && codigos().join() === 'A3,A1' && $('filtros-activos').textContent === '2', codigos().join());
+  // Pantalla de computadora: la barra queda abierta en su lugar, a la izquierda
+  const marco = document.getElementById('marco');
+  marco.style.width = '1100px';
+  // El navegador avisa el cambio de ancho recién al dibujar la página: con la pestaña oculta o
+  // minimizada esto no pasa y la prueba falla aunque el sitio esté bien. Correrla con la pestaña a la vista.
+  for (let i = 0; i < 30 && !$('filtros-panel').open; i++) await espera(100);
+  const panel = $('filtros-panel');
+  const rPanel = panel.getBoundingClientRect(), rGrilla = $('grilla').getBoundingClientRect();
+  chequear('en computadora la barra lateral queda abierta, a la izquierda de los productos', panel.open && !panel.matches(':modal') && rPanel.right <= rGrilla.left && rPanel.width > 200, `${Math.round(rPanel.left)}-${Math.round(rPanel.right)} / grilla desde ${Math.round(rGrilla.left)}`);
+  chequear('en computadora no hace falta el botón "Filtros y orden"', getComputedStyle($('abrir-filtros')).display === 'none');
+  chequear('en computadora el menú de secciones se ve arriba', getComputedStyle($('menu')).display !== 'none' && d.querySelectorAll('#menu a').length === 4);
+  marco.style.width = '375px';
+  for (let i = 0; i < 30 && $('filtros-panel').open; i++) await espera(100);
+  chequear('al volver al celular la barra se esconde de nuevo', !$('filtros-panel').open);
+
+  // ---------- 6. Menú y secciones ----------
+  chequear('en el celular, el botón ☰ abre el menú', !$('abrir-menu').hidden);
+  $('abrir-menu').click();
+  chequear('el menú lista Catálogo + las 3 secciones', $('menu-movil').open && [...d.querySelectorAll('#menu-movil-lista a')].map(a => a.textContent).join('|') === 'Catálogo|Quiénes somos|Preguntas|Contacto');
+  d.querySelector('#menu-movil-lista a[href$="quienes-somos"]').click();
+  await espera(100);
+  chequear('al elegir una sección: se cierra el menú, cambia la dirección y se ve la sección', !$('menu-movil').open && w.location.search === '?pagina=quienes-somos' && !$('vista-pagina').hidden && $('vista-catalogo').hidden);
+  chequear('el foco va al título de la sección', d.activeElement === $('pagina-titulo'));
+  const art = $('vista-pagina');
+  chequear('el texto de la planilla se ve como texto (sin etiquetas reales)', art.textContent.includes('<b>etiqueta</b>') && !art.querySelector('b'));
+  chequear('línea en blanco = párrafo nuevo; salto simple = misma línea con corte', art.querySelectorAll('p').length === 2 && art.querySelector('p br'));
+  chequear('las direcciones https se vuelven enlaces (sin el punto final)', art.querySelector('p a') && art.querySelector('p a').getAttribute('href') === 'https://ejemplo.com/ruta', art.querySelector('p a') && art.querySelector('p a').getAttribute('href'));
+  chequear('líneas con "- " = lista', art.querySelectorAll('ul li').length === 2);
+  chequear('el menú marca la sección actual', d.querySelector('#menu a[aria-current="page"]').textContent === 'Quiénes somos');
+  d.querySelector('#pie-menu a[href$="preguntas-frecuentes"]').click();
+  await espera(100);
+  chequear('preguntas frecuentes: cada ## es una pregunta desplegable', art.querySelectorAll('details.pregunta').length === 2 && art.querySelector('summary').textContent === '¿Primera?');
+  d.querySelector('#pie-menu a[href$="contacto"]').click();
+  await espera(100);
+  chequear('contacto: agrega solos los botones de WhatsApp y mail', !!art.querySelector('a.boton-whatsapp[href^="https://wa.me/5491100000000"]') && !!art.querySelector('a[href="mailto:prueba@ejemplo.com"]'));
+  w.history.back();
+  await espera(300);
+  chequear('"atrás" vuelve a la sección anterior', w.location.search === '?pagina=preguntas-frecuentes' && art.querySelectorAll('details').length === 2, w.location.search);
+  art.querySelector('.botones-pagina a.boton-primario').click();
+  await espera(100);
+  chequear('"Ver el catálogo" vuelve al catálogo', !$('vista-catalogo').hidden && $('vista-pagina').hidden && w.location.search === '');
+  ({ w, d, $ } = await cargarSitio('?pagina=contacto'));
+  await espera(200);
+  chequear('un enlace directo ?pagina=contacto abre esa sección', !$('vista-pagina').hidden && $('pagina-titulo').textContent === 'Contacto');
+  ({ w, d, $ } = await cargarSitio('?pagina=no-existe'));
+  await espera(200);
+  chequear('una sección que no existe → muestra el catálogo', !$('vista-catalogo').hidden && $('vista-pagina').hidden && w.location.search === '', w.location.search);
+  delete window.__CATALOGO.paginas;
+  localStorage.removeItem('catalogo_cache_v1');
+  ({ w, d, $ } = await cargarSitio());
+  chequear('si la planilla no tiene la hoja Páginas, no aparece el menú (y nada se rompe)', $('abrir-menu').hidden && !d.querySelector('#menu a') && d.querySelectorAll('#grilla .tarjeta').length === 3);
+
+  // ---------- 7. Precios por cantidad y mayoristas ----------
+  window.__CATALOGO = catalogo([
+    producto('M1', { precio: 10000, escalas: [{ desde: 6, descuento: 0.05 }] }),
+    producto('M2', { precio: 2000 }),
+  ]);
+  window.__CATALOGO.negocio.mayoristas = true;
+  window.__MAYORISTA = { escalas: { M1: [{ desde: 6, descuento: 0.15 }, { desde: 24, descuento: 0.25 }], M2: [{ desde: 10, descuento: 0.2 }] }, monto_minimo: 0, unidades_minimas: 0 };
+  localStorage.removeItem('catalogo_cache_v1');
+  localStorage.removeItem('catalogo_mayorista_v1');
+  localStorage.setItem('catalogo_pedido_v1', JSON.stringify({ M1: 6 }));
+  ({ w, d, $ } = await cargarSitio());
+  const tarjetaM1 = () => [...d.querySelectorAll('#grilla .tarjeta')].find(t => t.textContent.includes('Producto M1'));
+  chequear('minorista: la tarjeta muestra la escala pública (desde 6 u. $9.500 c/u)', /desde 6 u\.\s*\$\s*9\.500 c\/u \(−5%\)/.test(tarjetaM1().querySelector('.escala').textContent), tarjetaM1().querySelector('.escala') && tarjetaM1().querySelector('.escala').textContent);
+  chequear('minorista: 6 × M1 en el pedido = $57.000 (escala −5%)', /57\.000/.test($('totales').textContent) && /9\.500 c\/u \(−5%\)/.test($('lineas').textContent), $('totales').textContent);
+  chequear('la franja ofrece "¿Sos mayorista? Ingresá"', !$('barra-mayorista').hidden && /Sos mayorista/.test($('barra-mayorista').textContent));
+  chequear('sin ingresar, el sitio no tiene las escalas mayoristas', !/15%|−15|25%/.test(d.body.textContent));
+
+  // Pedir acceso
+  d.querySelector('#barra-mayorista .enlace-boton').click();
+  chequear('"Ingresá" abre el recuadro de ingreso', $('dialogo-mayorista').open);
+  $('enviar-mayorista').click();
+  await espera(50);
+  chequear('sin nombre, mail ni consentimiento → avisa qué falta', !$('em-nombre').hidden && !$('em-mail').hidden && !$('em-consentimiento').hidden);
+  $('m-nombre').value = 'Mayo Rista'; $('m-mail').value = 'mayo@ejemplo.com'; $('m-consentimiento').checked = true;
+  const antesM = w.__posts.length;
+  $('enviar-mayorista').click();
+  await espera(200);
+  const pedidoAcceso = JSON.parse(w.__posts[antesM].opciones.body);
+  chequear('manda el pedido de acceso (sin cabeceras) y muestra "Revisá tu mail"', pedidoAcceso.tipo === 'mayorista_acceso' && w.__posts[antesM].opciones.headers === undefined && !$('mayorista-enviado').hidden && /mayo@ejemplo\.com/.test($('mayorista-enviado-texto').textContent));
+  $('mayorista-listo').click();
+
+  // Abrir el enlace del mail
+  ({ w, d, $ } = await cargarSitio('?acceso=tokenmalo'));
+  await espera(400);
+  chequear('un enlace vencido o inventado → lo explica y sigue como minorista', /venció o ya se usó/.test($('barra-mayorista').textContent) && !w.localStorage.getItem('catalogo_mayorista_v1'), $('barra-mayorista').textContent);
+  ({ w, d, $ } = await cargarSitio('?acceso=tokenbueno0123456789abcdef0123456789'));
+  await hasta(() => /Total mayorista/.test($('totales').textContent));
+  chequear('enlace bueno → "¡Listo, Mayo Rista!" y queda guardada la sesión', /Listo, Mayo Rista/.test($('barra-mayorista').textContent) && JSON.parse(w.localStorage.getItem('catalogo_mayorista_v1')).sesion === 'SESION-OK', $('barra-mayorista').textContent);
+  chequear('el enlace se borra de la dirección (no queda en el historial)', !/acceso=/.test(w.location.search), w.location.search);
+  chequear('mayorista: la tarjeta muestra su escala (desde 6 u. $8.500 c/u)', /Mayorista: desde 6 u\.\s*\$\s*8\.500 c\/u \(−15%\)/.test(tarjetaM1().querySelector('.escala').textContent), tarjetaM1().querySelector('.escala').textContent);
+  chequear('mayorista: 6 × M1 = $51.000 y dice "Total mayorista"', /Total mayorista contado/.test($('totales').textContent) && /51\.000/.test($('totales').textContent), $('totales').textContent);
+  chequear('mayorista: el mensaje de WhatsApp dice MAYORISTA y su nombre', /MAYORISTA/.test(decodeURIComponent($('enviar-whatsapp').href)) && /Cliente mayorista: Mayo Rista/.test(decodeURIComponent($('enviar-whatsapp').href)));
+  d.querySelector('#grilla .tarjeta h2 a').click();
+  await espera(100);
+  chequear('la página del producto muestra la tabla de precios por cantidad (pública y mayorista)', d.querySelectorAll('#ficha .ficha-escalas li').length === 3 && /Mayorista, desde 24 u\./.test($('ficha').textContent));
+  $('cerrar-ficha').click();
+  d.addEventListener('click', e => { if (e.target.id === 'enviar-whatsapp') e.preventDefault(); }, true);
+  $('enviar-whatsapp').click();
+  chequear('el aviso de WhatsApp a la planilla lleva la sesión del mayorista', JSON.parse(w.__beacons[w.__beacons.length - 1].cuerpo).sesion === 'SESION-OK');
+  $('abrir-pedido').click(); $('mostrar-formulario').click();
+  $('f-nombre').value = 'Mayo'; $('f-telefono').value = '11'; $('f-consentimiento').checked = true;
+  $('enviar-formulario').click();
+  await espera(200);
+  chequear('el pedido por formulario lleva la sesión (el script calcula el precio)', JSON.parse(w.__posts[w.__posts.length - 1].opciones.body).sesion === 'SESION-OK');
+  $('otro-pedido').click();
+
+  // Mínimos
+  window.__MAYORISTA.monto_minimo = 100000;
+  w.localStorage.setItem('catalogo_pedido_v1', JSON.stringify({ M1: 6 }));
+  ({ w, d, $ } = await cargarSitio());
+  await hasta(() => /Te faltan/.test($('totales').textContent));
+  chequear('monto mínimo $100.000 sin alcanzar → avisa cuánto falta y calcula como minorista ($57.000)', /Te faltan \$\s*49\.000/.test($('totales').textContent) && /57\.000/.test($('totales').textContent),
+    $('totales').textContent + ' | envíos: ' + JSON.stringify(w.__posts.map(p => JSON.parse(p.opciones.body).tipo || 'pedido')) + ' | guardado: ' + w.localStorage.getItem('catalogo_mayorista_v1') + ' | url: ' + w.location.href);
+  chequear('nunca aparece la palabra "null" en el pedido', !/null/.test($('panel-pedido').textContent));
+  chequear('la franja muestra las condiciones (pedido mínimo)', /pedido mínimo \$\s*100\.000/.test($('barra-mayorista').textContent), $('barra-mayorista').textContent);
+  window.__MAYORISTA.monto_minimo = 0;
+  window.__MAYORISTA.unidades_minimas = 12;
+  ({ w, d, $ } = await cargarSitio());
+  await hasta(() => /desde 12 u/.test($('lineas').textContent));
+  chequear('unidades mínimas 12: con 6 u. se aclara "Precio mayorista desde 12 u." y va la escala pública', /Precio mayorista desde 12 u\./.test($('lineas').textContent) && /57\.000/.test($('totales').textContent), $('lineas').textContent);
+  chequear('…y la tarjeta muestra la escala mayorista desde 12 u.', /Mayorista: desde 12 u\./.test(tarjetaM1().querySelector('.escala').textContent));
+  window.__MAYORISTA.unidades_minimas = 0;
+
+  // Baja y salir
+  window.__MAYORISTA.bloqueado = true;
+  ({ w, d, $ } = await cargarSitio());
+  await hasta(() => /dado de baja/.test($('barra-mayorista').textContent));
+  chequear('si Pablo lo da de baja (Activo = no), el sitio lo saca y lo avisa', !w.localStorage.getItem('catalogo_mayorista_v1') && /venció o fue dado de baja/.test($('barra-mayorista').textContent) && /57\.000/.test($('totales').textContent));
+  window.__MAYORISTA.bloqueado = false;
+  w.localStorage.setItem('catalogo_mayorista_v1', JSON.stringify({ sesion: 'SESION-OK', nombre: 'Mayo Rista' }));
+  ({ w, d, $ } = await cargarSitio());
+  await espera(400);
+  d.querySelector('#barra-mayorista .enlace-boton').click();
+  chequear('"Salir" vuelve a precios minoristas', !w.localStorage.getItem('catalogo_mayorista_v1') && /Sos mayorista/.test($('barra-mayorista').textContent) && /57\.000/.test($('totales').textContent));
+  localStorage.removeItem('catalogo_mayorista_v1');
+
+  // ---------- 8. Productos con opciones (Grupo + características) ----------
+  const opcion = (codigo, medida, material, precio, estado) => producto(codigo, {
+    nombre: `Válvula (${medida} · ${material})`, grupo: 'Válvula', categoria: 'A', precio, estado: estado || 'disponible',
+    opciones: [{ nombre: 'Medida', valor: medida }, { nombre: 'Material', valor: material }],
+  });
+  window.__CATALOGO = catalogo([
+    producto('S1', { nombre: 'Producto suelto', precio: 1000 }),
+    opcion('V1', '1/2"', 'PPR', 3000),
+    opcion('V2', '3/4"', 'PPR', 4200),
+    opcion('V3', '3/4"', 'PP', 3500),
+    opcion('V4', '1"', 'PPR', 5500, 'sin_stock'),
+  ]);
+  window.__CATALOGO.negocio.mayoristas = false;
+  localStorage.removeItem('catalogo_cache_v1');
+  localStorage.setItem('catalogo_pedido_v1', '{}');
+  ({ w, d, $ } = await cargarSitio());
+  const tarjetaV = () => d.querySelector('#grilla .tarjeta-grupo');
+  chequear('las 4 opciones se ven como UNA tarjeta (2 productos en total)', d.querySelectorAll('#grilla .tarjeta').length === 2 && $('estado').textContent === '2 productos', $('estado').textContent);
+  chequear('la tarjeta dice "desde $3.000", qué medidas hay y cuántas opciones', /desde\s*\$\s*3\.000/.test(tarjetaV().textContent) && /Medida: 1\/2" · 3\/4" · 1"/.test(tarjetaV().textContent) && /4 opciones/.test(tarjetaV().textContent), tarjetaV().textContent);
+  chequear('el botón dice "Elegir opciones" (hay 2 características)', tarjetaV().querySelector('.accion button').textContent === 'Elegir opciones');
+  tarjetaV().querySelector('.accion button').click();
+  await espera(100);
+  chequear('abre la página del grupo, sin opción elegida y con la dirección ?g=valvula', $('ficha').open && $('ficha-titulo').textContent === 'Válvula' && w.location.search === '?g=valvula', w.location.search);
+  chequear('sin elegir: "Elegí medida y material…" y el botón está desactivado', /Elegí medida y material/.test($('ficha').textContent) && d.querySelector('#ficha .accion button').disabled);
+  const chip = (n, v) => [...d.querySelectorAll('#ficha .chip')].find(b => b.dataset.nombre === n && b.dataset.valor === v);
+  chip('Medida', '1/2"').click();
+  chequear('elegir 1/2" → el material se elige solo (solo existe PPR) y aparece el precio $3.000', chip('Material', 'PPR').getAttribute('aria-pressed') === 'true' && /3\.000/.test(d.querySelector('#ficha .precio').textContent) && /Código V1/.test($('ficha').textContent));
+  chequear('la dirección pasa a ?p=V1 (se puede compartir esa opción)', w.location.search === '?p=V1', w.location.search);
+  chequear('el foco queda en el botón que se tocó', d.activeElement === chip('Medida', '1/2"'));
+  chequear('PP no combina con 1/2": se ve con borde punteado', chip('Material', 'PP').classList.contains('chip-otra'));
+  chip('Medida', '3/4"').click();
+  chequear('cambiar a 3/4" mantiene PPR (existe) → V2 $4.200', /Código V2/.test($('ficha').textContent) && /4\.200/.test(d.querySelector('#ficha .precio').textContent));
+  chip('Material', 'PP').click();
+  chequear('elegir PP → V3 $3.500', /Código V3/.test($('ficha').textContent));
+  chip('Medida', '1"').click();
+  chequear('elegir 1" (solo existe en PPR) cambia el material a PPR y muestra "Sin stock"', chip('Material', 'PPR').getAttribute('aria-pressed') === 'true' && d.querySelector('#ficha .accion button').disabled && /Sin stock/.test(d.querySelector('#ficha .accion').textContent));
+  chip('Medida', '3/4"').click(); chip('Material', 'PP').click();
+  d.querySelector('#ficha .accion button').click();
+  chequear('"Agregar" suma la opción elegida (V3) al pedido', JSON.parse(w.localStorage.getItem('catalogo_pedido_v1')).V3 === 1 && $('contador').textContent === '1');
+  $('cerrar-ficha').click();
+  await espera(300);
+  chequear('al cerrar, la dirección vuelve a la del catálogo', !$('ficha').open && w.location.search === '', w.location.search);
+  chequear('en el pedido se lee qué opción eligió', /Válvula \(3\/4" · PP\)/.test($('lineas').textContent), $('lineas').textContent);
+  ({ w, d, $ } = await cargarSitio('?p=V2'));
+  await hasta(() => $('ficha').open);
+  chequear('un enlace a una opción (?p=V2) abre el grupo con esa opción elegida', $('ficha').open && chip('Medida', '3/4"').getAttribute('aria-pressed') === 'true' && chip('Material', 'PPR').getAttribute('aria-pressed') === 'true');
+  $('cerrar-ficha').click();
+  ({ w, d, $ } = await cargarSitio('?g=valvula'));
+  await hasta(() => $('ficha').open);
+  chequear('un enlace al grupo (?g=valvula) lo abre sin opción elegida', $('ficha').open && !d.querySelector('#ficha .chip[aria-pressed="true"]'));
+  $('cerrar-ficha').click();
+  const buscadorV = $('buscador');
+  buscadorV.value = 'pp 3/4'; buscadorV.dispatchEvent(new w.Event('input'));
+  await espera(300);
+  chequear('el buscador encuentra el grupo por sus opciones ("pp 3/4")', d.querySelectorAll('#grilla .tarjeta-grupo').length === 1 && d.querySelectorAll('#grilla .tarjeta').length === 1);
+  buscadorV.value = ''; buscadorV.dispatchEvent(new w.Event('input'));
+  await espera(300);
+  $('orden').value = 'precio-asc'; $('orden').dispatchEvent(new w.Event('change'));
+  chequear('"Menor precio" usa el precio más bajo del grupo ($3.000 va después de $1.000)', d.querySelector('#grilla .tarjeta h2').textContent === 'Producto suelto');
+  $('orden').value = 'precio-desc'; $('orden').dispatchEvent(new w.Event('change'));
+  chequear('"Mayor precio": el grupo ($3.000) antes que el suelto ($1.000)', d.querySelector('#grilla .tarjeta h2').textContent === 'Válvula');
+
+  // ---------- 9. Subcategorías ----------
+  window.__CATALOGO = catalogo([
+    producto('T1', { categoria: 'Válvulas' }), producto('T2', { categoria: 'Válvulas' }),
+    producto('T3', { categoria: 'Codos' }), producto('T4', { categoria: 'Termofusión' }), producto('T5', { categoria: 'Herramientas' }),
+  ]);
+  window.__CATALOGO.categorias = ['Termofusión', 'Válvulas', 'Codos', 'Herramientas'];
+  window.__CATALOGO.arbol = [{ nombre: 'Termofusión', hijas: ['Válvulas', 'Codos'] }, { nombre: 'Herramientas', hijas: [] }];
+  localStorage.removeItem('catalogo_cache_v1');
+  localStorage.setItem('catalogo_pedido_v1', '{}');
+  ({ w, d, $ } = await cargarSitio());
+  const filtrosTxt = () => [...d.querySelectorAll('#filtros .filtro')].map(b => b.textContent).join('|');
+  chequear('árbol: arranca con las categorías grandes; la grande cuenta todo lo de sus subcategorías (Termofusión 4)', filtrosTxt() === 'Todos5|Termofusión4|Herramientas1', filtrosTxt());
+  const btnCat = n => [...d.querySelectorAll('#filtros .filtro')].find(b => b.dataset.valor === n);
+  $('abrir-filtros').click(); // en el celular la lista está en el panel "Categorías y orden"
+  btnCat('Termofusión').click();
+  chequear('árbol: tocar la grande abre sus subcategorías y muestra todos sus productos', filtrosTxt() === 'Todos5|Termofusión4|Válvulas2|Codos1|Herramientas1' && d.querySelectorAll('#grilla .tarjeta').length === 4 && btnCat('Termofusión').getAttribute('aria-expanded') === 'true', filtrosTxt());
+  chequear('árbol: el foco queda en la categoría tocada', d.activeElement === btnCat('Termofusión'));
+  btnCat('Válvulas').click();
+  chequear('árbol: tocar una subcategoría muestra solo lo suyo y la grande sigue abierta', d.querySelectorAll('#grilla .tarjeta').length === 2 && !!btnCat('Codos') && btnCat('Válvulas').getAttribute('aria-pressed') === 'true');
+  btnCat('Herramientas').click();
+  chequear('árbol: al elegir otra grande, las subcategorías de la anterior se cierran', !btnCat('Válvulas') && d.querySelectorAll('#grilla .tarjeta').length === 1);
+  btnCat('__todas__').click();
+  $('aplicar-filtros').click();
+  d.querySelector('#grilla .tarjeta h2 a').click();
+  await espera(100);
+  chequear('árbol: la página del producto dice "Termofusión › Válvulas"', $('ficha-migas').textContent === 'Termofusión › Válvulas', $('ficha-migas').textContent);
+  $('cerrar-ficha').click();
+
+  // No dejar el catálogo falso guardado: el sitio real lo mostraría al abrirse en esta compu.
+  localStorage.removeItem('catalogo_cache_v1');
+  localStorage.removeItem('catalogo_pedido_v1');
+
+  const resumen = document.createElement('h2');
+  resumen.className = fallas ? 'mal' : 'ok';
+  resumen.textContent = fallas ? `${fallas} prueba(s) fallaron` : 'Todas las pruebas pasaron';
+  document.body.insertBefore(resumen, lista);
+}
+correr().catch(err => chequear('error inesperado', false, err.stack));
+</script>
+</body>
+</html>

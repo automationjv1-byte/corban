@@ -1,0 +1,623 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>Prueba del script (simulación)</title>
+<style>
+  body { font: 15px/1.5 system-ui, sans-serif; margin: 24px; }
+  .ok { color: #13703a; } .mal { color: #b3261e; font-weight: bold; }
+  pre { background: #f3f4f6; padding: 12px; overflow: auto; }
+</style>
+</head>
+<body>
+<h1>Prueba del script de Apps Script (simulación local)</h1>
+<p>Simula la planilla, la caché y el mail, y corre <code>apps-script/Codigo.gs</code> tal cual. No toca nada real.</p>
+<ul id="resultados"></ul>
+<pre id="muestra"></pre>
+<script>
+// ---------------------------------------------------------------
+// Simulación mínima de los servicios de Google
+// ---------------------------------------------------------------
+const encadenable = () => new Proxy(function () {}, { get: (t, p) => p === 'then' ? undefined : encadenable(), apply: () => encadenable() });
+
+function a1(ref) {
+  const m = ref.match(/^([A-Z]+)(\d*)(?::([A-Z]+)(\d*))?$/);
+  const col = s => s.split('').reduce((n, c) => n * 26 + c.charCodeAt(0) - 64, 0);
+  const r1 = Number(m[2] || 1), c1 = col(m[1]);
+  if (!m[3]) return [r1, c1, 1, 1];
+  const r2 = m[4] ? Number(m[4]) : 1000, c2 = col(m[3]);
+  return [r1, c1, r2 - r1 + 1, c2 - c1 + 1];
+}
+
+class Hoja {
+  constructor(nombre) { this.nombre = nombre; this.datos = []; this.formulas = {}; this.fallarAlAgregar = false; }
+  getName() { return this.nombre; }
+  getLastRow() { return this.datos.length; }
+  getLastColumn() { return Math.max(0, ...this.datos.map(f => f.length)); }
+  celda(r, c) { return (this.datos[r - 1] || [])[c - 1] ?? ''; }
+  poner(r, c, v) { while (this.datos.length < r) this.datos.push([]); const f = this.datos[r - 1]; while (f.length < c) f.push(''); f[c - 1] = v; }
+  getRange(a, b, c, d) {
+    const [r, col, nr, nc] = typeof a === 'string' ? a1(a) : [a, b, c || 1, d || 1];
+    return rango(this, r, col, nr, nc);
+  }
+  getDataRange() { return rango(this, 1, 1, Math.max(1, this.getLastRow()), Math.max(1, this.getLastColumn())); }
+  setFrozenRows() {} setRowHeight() {} setColumnWidth() {} setConditionalFormatRules() {} setTabColor() {}
+  newChart() { return encadenable(); } insertChart() { this.graficos = (this.graficos || 0) + 1; }
+  deleteRow(n) { this.datos.splice(n - 1, 1); }
+  insertRowAfter(n) { this.datos.splice(n, 0, []); }
+  clear() { this.datos = []; } clearNotes() {}
+  protect() { return encadenable(); }
+  appendRow(fila) { if (this.fallarAlAgregar) throw new Error('planilla caída (simulado)'); this.datos.push(fila.slice()); }
+}
+function rango(h, r, c, nr, nc) {
+  const base = {
+    getSheet: () => h, getRow: () => r, getColumn: () => c, getNumRows: () => nr, getNumColumns: () => nc,
+    getValues: () => Array.from({ length: nr }, (_, i) => Array.from({ length: nc }, (_, j) => h.celda(r + i, c + j))),
+    getValue: () => h.celda(r, c),
+    getDisplayValue: () => String(h.celda(r, c)),
+    setValues: v => { v.forEach((f, i) => f.forEach((x, j) => h.poner(r + i, c + j, x))); return prox; },
+    setValue: v => { h.poner(r, c, v); return prox; },
+    setFormula: f => { h.formulas[`${r},${c}`] = f; return prox; },
+    clearContent: () => { h.poner(r, c, ''); return prox; },
+    setDataValidation: v => { (h.validaciones = h.validaciones || {})[c] = v; return prox; },
+  };
+  const prox = new Proxy(base, { get: (t, p) => p in t ? t[p] : () => prox });
+  return prox;
+}
+const hojas = new Map();
+const libro = {
+  getSheetByName: n => hojas.get(n) || null,
+  insertSheet: n => { const h = new Hoja(n); hojas.set(n, h); return h; },
+  getSheets: () => [...hojas.values()],
+  deleteSheet: h => hojas.delete(h.nombre),
+  setActiveSheet: () => {}, toast: (m, t) => { libro.ultimoToast = (t || '') + ': ' + m; },
+};
+const SpreadsheetApp = {
+  getActiveSpreadsheet: () => libro,
+  // Anota lo que se pidió (requireValueInList, etc.) para poder revisarlo después.
+  newDataValidation: () => { const regla = {}; const b = new Proxy(regla, { get: (t, k) => (k === 'build' ? () => t : (...a) => { t[k] = a; return b; }) }); return b; },
+  newConditionalFormatRule: encadenable, getUi: encadenable,
+  flush: () => {},
+};
+const Charts = { ChartType: { COLUMN: 'COLUMN', BAR: 'BAR' } };
+const memoria = new Map();
+const CacheService = { getScriptCache: () => ({
+  get: k => memoria.get(k) ?? null,
+  put: (k, v) => memoria.set(k, v),
+  getAll: ks => Object.fromEntries(ks.filter(k => memoria.has(k)).map(k => [k, memoria.get(k)])),
+  putAll: o => Object.entries(o).forEach(([k, v]) => { if (v.length > 100000) throw new Error('muy grande'); memoria.set(k, v); }),
+  remove: k => memoria.delete(k),
+}) };
+const enviados = [];
+const MailApp = {
+  fallar: false,
+  sendEmail: (o, asunto, cuerpo) => { if (MailApp.fallar) throw new Error('Service invoked too many times for one day: email.'); enviados.push(typeof o === 'string' ? { to: o, subject: asunto, body: cuerpo } : o); orden.push('mail'); },
+  getRemainingDailyQuota: () => 100 - enviados.length,
+};
+const orden = [];
+const props = {};
+const PropertiesService = { getScriptProperties: () => ({ getProperty: k => props[k] ?? null, setProperty: (k, v) => { props[k] = v; } }) };
+const LockService = { getScriptLock: () => ({ waitLock() {}, releaseLock() {} }) };
+const ContentService = { MimeType: { JSON: 'json' }, createTextOutput: s => ({ texto: s, setMimeType() { return this; } }) };
+// Resumen NO criptográfico: alcanza para simular firmas (cambia si cambia cualquier letra).
+function hashFalso(s) {
+  const out = []; let h = 2166136261;
+  for (let r = 0; r < 32; r++) { for (const c of s + r) { h ^= c.charCodeAt(0); h = Math.imul(h, 16777619); } out.push(((h >>> 0) & 255) - 128); }
+  return out;
+}
+const Utilities = {
+  formatDate: d => d.toISOString().slice(0, 16),
+  Charset: { UTF_8: 'UTF-8' },
+  DigestAlgorithm: { SHA_256: 'SHA_256' },
+  getUuid: () => crypto.randomUUID(),
+  base64EncodeWebSafe: v => {
+    const bytes = typeof v === 'string' ? new TextEncoder().encode(v) : Uint8Array.from(v.map(b => b & 255));
+    let s = ''; bytes.forEach(b => { s += String.fromCharCode(b); });
+    return btoa(s).replace(/\+/g, '-').replace(/\//g, '_');
+  },
+  base64DecodeWebSafe: t => Array.from(atob(t.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0)),
+  newBlob: bytes => ({ getDataAsString: () => new TextDecoder().decode(Uint8Array.from(bytes.map(b => b & 255))) }),
+  computeHmacSha256Signature: (texto, clave) => hashFalso(clave + '::' + texto),
+  computeDigest: (alg, texto) => hashFalso(String(texto)),
+};
+const Session = { getScriptTimeZone: () => 'America/Argentina/Buenos_Aires' };
+
+// ---------------------------------------------------------------
+// Pruebas
+// ---------------------------------------------------------------
+const lista = document.getElementById('resultados');
+let fallas = 0;
+function chequear(nombre, condicion, detalle) {
+  const li = document.createElement('li');
+  li.className = condicion ? 'ok' : 'mal';
+  li.textContent = (condicion ? '✔ ' : '✘ ') + nombre + (condicion || !detalle ? '' : ' — ' + detalle);
+  lista.appendChild(li);
+  if (!condicion) fallas++;
+}
+const respuesta = salida => JSON.parse(salida.texto);
+const post = obj => respuesta(doPost({ postData: { contents: JSON.stringify(obj) } }));
+const editar = (hoja, fila, col, valor) => { hojas.get(hoja).poner(fila, col, valor); onEdit({ source: libro, value: valor, range: hojas.get(hoja).getRange(fila, col) }); };
+const fila = (hoja, codigo) => hojas.get(hoja).datos.findIndex(f => f[0] === codigo) + 1;
+const columnaProductos = titulo => hojas.get('Productos').datos[0].indexOf(titulo) + 1;
+
+async function correr() {
+  const codigo = await (await fetch('../apps-script/Codigo.gs', { cache: 'no-store' })).text();
+  const s = document.createElement('script');
+  s.textContent = codigo;
+  document.body.appendChild(s);
+
+  // 1. Armado de la planilla
+  libro.insertSheet('Hoja 1');
+  configurarPlanilla();
+  chequear('configurarPlanilla crea las 10 hojas y saca "Hoja 1"',
+    ['Productos', 'Categorías', 'Financiación', 'Cuotas (calculado)', 'Pedidos', 'Configuración', 'Páginas', 'Escalas', 'Mayoristas', 'Reportes'].every(n => hojas.has(n)) && !hojas.has('Hoja 1'));
+  const rep = hojas.get('Reportes');
+  chequear('Reportes: arma el resumen, las tablas, los nombres y 2 gráficos',
+    ['5,2', '6,2', '7,2', '11,2', '5,4', '5,8', '5,12', '5,16', '15,1', '16,3', '15,5', '16,7'].every(k => rep.formulas[k]) && rep.graficos === 2,
+    Object.keys(rep.formulas).join(' '));
+  chequear('Reportes: cuenta como venta solo Confirmado o Entregado, y busca las columnas por título',
+    /SUMIFS\(c\("Total contado"\),c\("Estado"\),"Confirmado"\)\+SUMIFS\(c\("Total contado"\),c\("Estado"\),"Entregado"\)/.test(rep.formulas['5,2']) &&
+    /XMATCH\(n,h\)/.test(rep.formulas['5,4']) && /\^\(Confirmado\|Entregado\)\$/.test(rep.formulas['5,4']));
+  const antes = JSON.stringify(hojas.get('Productos').datos);
+  configurarPlanilla();
+  chequear('correrlo dos veces no pisa nada', JSON.stringify(hojas.get('Productos').datos) === antes && /No hice cambios/.test(libro.ultimoToast));
+  chequear('Categorías viene en dos columnas: Categoría | Subcategoría', JSON.stringify(hojas.get('Categorías').datos[0]) === '["Categoría","Subcategoría"]', JSON.stringify(hojas.get('Categorías').datos[0]));
+  hojas.get('Categorías').datos.push(['Categoría A', 'Subcategoría A1']);
+
+  // La hoja calculada la llenan fórmulas de Google; acá se simula su resultado.
+  const cuotas = hojas.get('Cuotas (calculado)');
+  cuotas.datos = [['Código', 3, 6]];
+  hojas.get('Productos').datos.slice(1).forEach(f => cuotas.datos.push([f[0], +(f[4] / 3).toFixed(2), +(f[4] * 1.15 / 6).toFixed(2)]));
+
+  // 2. Prueba de vida
+  const vida = respuesta(doGet({ parameter: {} }));
+  chequear('prueba de vida responde {"ok":true,"productos":9}', vida.ok === true && vida.productos === 9, JSON.stringify(vida));
+
+  // 3. Catálogo
+  const cat = respuesta(doGet({ parameter: { accion: 'catalogo' } }));
+  const textoCat = JSON.stringify(cat);
+  document.getElementById('muestra').textContent = JSON.stringify(cat, null, 2);
+  chequear('el inactivo (P006) no sale', !cat.productos.some(p => p.codigo === 'P006'));
+  chequear('no salen columnas privadas (costo, proveedor, notas)',
+    !/Proveedor|15000|Activo = no|costo|notas/i.test(JSON.stringify(cat.productos)) && cat.productos.every(p => !('costo' in p) && !('proveedor' in p)));
+  chequear('no sale el número de stock (mostrar_stock_exacto = no)', cat.productos.every(p => !('cantidad' in p) && !('stock' in p)));
+  const est = Object.fromEntries(cat.productos.map(p => [p.codigo, p.estado]));
+  chequear('estados: P001 disponible, P002 últimas, P003 sin stock', est.P001 === 'disponible' && est.P002 === 'ultimas' && est.P003 === 'sin_stock', JSON.stringify(est));
+  chequear('categorías en el orden de la hoja', JSON.stringify(cat.categorias) === '["Categoría A","Categoría B","Categoría C"]', JSON.stringify(cat.categorias));
+  chequear('árbol: una subcategoría sin productos no aparece (Subcategoría A1)', JSON.stringify(cat.arbol.map(n => [n.nombre, n.hijas])) === '[["Categoría A",[]],["Categoría B",[]],["Categoría C",[]]]', JSON.stringify(cat.arbol));
+  const colCatP = hojas.get('Productos').datos[0].indexOf('Categoría') + 1;
+  editar('Productos', fila('Productos', 'P002'), colCatP, 'Subcategoría A1');
+  const catSub = respuesta(doGet({ parameter: { accion: 'catalogo' } }));
+  chequear('árbol: con un producto en "Subcategoría A1", aparece dentro de "Categoría A" (y en la lista, justo después)',
+    JSON.stringify(catSub.arbol[0]) === '{"nombre":"Categoría A","hijas":["Subcategoría A1"]}' && catSub.categorias.join('|') === 'Categoría A|Subcategoría A1|Categoría B|Categoría C', JSON.stringify(catSub.arbol) + ' ' + catSub.categorias.join('|'));
+  const catH = hojas.get('Categorías');
+  catH.datos.push(['Categoría C', 'Sub de C']);
+  editar('Productos', fila('Productos', 'P003'), colCatP, 'Sub de C');
+  chequear('árbol: una categoría grande sin productos propios igual aparece si su subcategoría tiene',
+    respuesta(doGet({ parameter: { accion: 'catalogo' } })).arbol.some(n => n.nombre === 'Categoría C' && n.hijas[0] === 'Sub de C'));
+  editar('Productos', fila('Productos', 'P002'), colCatP, 'Categoría A');
+  editar('Productos', fila('Productos', 'P003'), colCatP, 'Categoría B');
+  catH.datos.pop();
+
+  // Categorías en el formato viejo (Nombre | Orden | Dentro de), con los datos reales de la planilla de prueba.
+  const catGuardada = JSON.stringify(catH.datos);
+  catH.datos = [['Nombre', 'Orden', 'Dentro de'], ['Termofusión', '1', 'CONEXIONES SANITARIAS PARA AGUA'], ['Flexibles', '2', 'CONEXIONES SANITARIAS PARA AGUA'],
+    ['Válvulas y canillas', '3', 'CONEXIONES SANITARIAS PARA AGUA'], ['Artículos varios', '4', 'CONEXIONES SANITARIAS PARA AGUA'], ['', '5', 'CALEFACCIÓN ']];
+  editar('Productos', fila('Productos', 'P001'), colCatP, 'Termofusion');
+  const arbolViejo = JSON.stringify(respuesta(doGet({ parameter: { accion: 'catalogo' } })).arbol[0]);
+  chequear('formato viejo: antes de migrar, el sitio igual arma el árbol', arbolViejo === '{"nombre":"CONEXIONES SANITARIAS PARA AGUA","hijas":["Termofusión"]}', arbolViejo);
+  configurarPlanilla();
+  chequear('configurarPlanilla pasa Categorías a dos columnas, en el mismo orden, sin perder CALEFACCIÓN',
+    JSON.stringify(catH.datos) === JSON.stringify([['Categoría', 'Subcategoría'], ['CONEXIONES SANITARIAS PARA AGUA', 'Termofusión'], ['CONEXIONES SANITARIAS PARA AGUA', 'Flexibles'],
+      ['CONEXIONES SANITARIAS PARA AGUA', 'Válvulas y canillas'], ['CONEXIONES SANITARIAS PARA AGUA', 'Artículos varios'], ['CALEFACCIÓN', '']]) && /dos columnas/.test(libro.ultimoToast),
+    JSON.stringify(catH.datos) + ' ' + libro.ultimoToast);
+  const regla = (hojas.get('Productos').validaciones || {})[colCatP] || {};
+  chequear('Productos: la columna Categoría tiene un desplegable con las subcategorías (y las grandes sin subcategorías)',
+    JSON.stringify((regla.requireValueInList || [])[0]) === '["Termofusión","Flexibles","Válvulas y canillas","Artículos varios","CALEFACCIÓN"]' && regla.setAllowInvalid && regla.setAllowInvalid[0] === true,
+    JSON.stringify(regla));
+  chequear('Categorías: la columna Categoría ofrece las grandes ya escritas', !!((catH.validaciones || {})[1] || {}).requireValueInRange);
+  const catMigrado = respuesta(doGet({ parameter: { accion: 'catalogo' } }));
+  chequear('después de migrar: mismo árbol, y "Termofusion" (sin tilde) en Productos cuenta como "Termofusión"',
+    JSON.stringify(catMigrado.arbol[0]) === arbolViejo && catMigrado.productos.find(p => p.codigo === 'P001').categoria === 'Termofusión', JSON.stringify(catMigrado.arbol[0]));
+  catH.datos.push(['Calefacción', 'Radiadores']);
+  editar('Categorías', catH.datos.length, 2, 'Radiadores');
+  chequear('al escribir una subcategoría nueva, el desplegable de Productos la suma enseguida',
+    ((hojas.get('Productos').validaciones[colCatP].requireValueInList || [])[0] || []).includes('Radiadores'), JSON.stringify(hojas.get('Productos').validaciones[colCatP]));
+  catH.datos = JSON.parse(catGuardada);
+  editar('Productos', fila('Productos', 'P001'), colCatP, 'Categoría A');
+
+  // Características con dos puntos de más ("Medida: : 1/2"", como quedaba al guardar "Medida:" en el formulario)
+  const colCar1 = columnaProductos('Característica 1');
+  editar('Productos', fila('Productos', 'P007'), colCar1, 'Medida: : 1/2"');
+  const p007 = respuesta(doGet({ parameter: { accion: 'catalogo' } })).productos.find(p => p.codigo === 'P007');
+  chequear('"Medida: : 1/2"" se lee como Medida = 1/2" (sin los dos puntos sobrantes)',
+    p007.opciones[0].nombre === 'Medida' && p007.opciones[0].valor === '1/2"' && /\(1\/2" · PPR\)$/.test(p007.nombre), JSON.stringify(p007.opciones) + ' ' + p007.nombre);
+  editar('Productos', fila('Productos', 'P007'), colCar1, 'Medida: 1/2"');
+
+  // "TUBO PN20" con la medida "20": el nombre igual tiene que decir la medida (antes se omitía porque "PN20" contiene "20").
+  const colGrupo = columnaProductos('Grupo'), grupoP007 = hojas.get('Productos').datos[fila('Productos', 'P007') - 1][colGrupo - 1];
+  editar('Productos', fila('Productos', 'P007'), colGrupo, 'Tubo PN20');
+  editar('Productos', fila('Productos', 'P007'), colCar1, 'Medida: 20');
+  const tubo = respuesta(doGet({ parameter: { accion: 'catalogo' } })).productos.find(p => p.codigo === 'P007');
+  chequear('con Grupo "Tubo PN20" y medida 20, el nombre dice "(20 · PPR)" (el pedido sabe qué medida es)', tubo.nombre === 'Tubo PN20 (20 · PPR)', tubo.nombre);
+  editar('Productos', fila('Productos', 'P007'), colGrupo, grupoP007);
+  editar('Productos', fila('Productos', 'P007'), colCar1, 'Medida: 1/2"');
+  chequear('financiación: solo opciones activas (3 y 6)', JSON.stringify(cat.financiacion.map(o => o.cuotas)) === '[3,6]', JSON.stringify(cat.financiacion));
+  chequear('cuotas por producto vienen de la hoja calculada', cat.productos[0].cuotas.length === 2 && cat.productos[0].cuotas[0].valor === 8333.33, JSON.stringify(cat.productos[0].cuotas));
+  chequear('negocio: WhatsApp solo con números', cat.negocio.whatsapp === '5491169484851');
+  chequear('no sale descontar_stock_al_confirmar', !('descontar_stock_al_confirmar' in cat.negocio));
+  const p7 = cat.productos.find(p => p.codigo === 'P007');
+  chequear('productos con opciones: traen Grupo y sus características', p7 && p7.grupo === 'Producto de ejemplo con opciones' && JSON.stringify(p7.opciones) === '[{"nombre":"Medida","valor":"1/2\\""},{"nombre":"Material","valor":"PPR"}]', JSON.stringify(p7));
+  chequear('con Grupo y sin Nombre, el nombre se arma solo: Grupo (1/2" · PPR)', p7 && p7.nombre === 'Producto de ejemplo con opciones (1/2" · PPR)', p7 && p7.nombre);
+  chequear('cada opción mantiene su precio y su stock (1" sin stock)', cat.productos.find(p => p.codigo === 'P010').estado === 'sin_stock' && cat.productos.find(p => p.codigo === 'P008').precio === 4200);
+  // Caso real (21/10): características cargadas sin "Nombre:" y el mismo Nombre en todas las filas.
+  const prodH = hojas.get('Productos');
+  const tp = prodH.datos[0];
+  const filaDe = o => tp.map(t => (t in o ? o[t] : ''));
+  prodH.datos.push(
+    filaDe({ 'Código': 'Q1', 'Nombre': 'Valvulas de drenaje', 'Categoría': 'Categoría A', 'Precio contado': 25000, 'Activo': 'sí', 'Grupo': 'Valvulas de drenaje', 'Característica 1': 'grande', 'Característica 2': 'gris', 'Característica 3': 'para llevar' }),
+    filaDe({ 'Código': 'Q2', 'Nombre': 'Valvulas de drenaje', 'Categoría': 'Categoría A', 'Precio contado': 30000, 'Activo': 'sí', 'Grupo': 'Valvulas de drenaje', 'Característica 1': 'mediano', 'Característica 2': 'Color: blanco', 'Característica 3': 'para retirar' }));
+  onEdit({ source: libro, value: 'x', range: prodH.getRange(2, 1) });
+  const catQ = respuesta(doGet({ parameter: { accion: 'catalogo' } }));
+  const q1 = catQ.productos.find(p => p.codigo === 'Q1');
+  const q2 = catQ.productos.find(p => p.codigo === 'Q2');
+  chequear('sin "Nombre:", cada columna es una característica distinta (Opción 1 / Color / Opción 3)',
+    JSON.stringify(q1.opciones.map(o => o.nombre)) === '["Opción 1","Color","Opción 3"]' && JSON.stringify(q2.opciones.map(o => o.nombre)) === '["Opción 1","Color","Opción 3"]',
+    JSON.stringify([q1.opciones, q2.opciones]));
+  chequear('"Color" escrito en una sola fila vale para todo el grupo', q1.opciones[1].nombre === 'Color' && q1.opciones[1].valor === 'gris');
+  chequear('con el mismo Nombre en todas las filas, el nombre suma la opción elegida', q1.nombre === 'Valvulas de drenaje (grande · gris · para llevar)' && q2.nombre === 'Valvulas de drenaje (mediano · blanco · para retirar)', q1.nombre + ' | ' + q2.nombre);
+  prodH.datos.splice(-2, 2);
+  onEdit({ source: libro, value: 'x', range: prodH.getRange(2, 1) });
+
+  chequear('las 4 secciones de "Páginas" salen en orden',
+    JSON.stringify(cat.paginas.map(p => p.clave)) === '["quienes-somos","envios-y-pagos","preguntas-frecuentes","contacto"]', JSON.stringify(cat.paginas));
+
+  // Páginas: inactiva, sin texto, y nombre corto escrito "a mano" con mayúsculas y tildes
+  const pag = hojas.get('Páginas');
+  pag.poner(2, 6, 'no');
+  pag.poner(4, 4, '');
+  pag.datos.push(['Quiénes Somos 2', '', 'Otra', 'Texto', 9, 'sí']);
+  onEdit({ source: libro, value: 'no', range: pag.getRange(2, 6) });
+  const pags = respuesta(doGet({ parameter: { accion: 'catalogo' } })).paginas;
+  chequear('Páginas: Activa = no o texto vacío → no aparece; el nombre corto se limpia (quienes-somos-2)',
+    JSON.stringify(pags.map(p => p.clave)) === '["envios-y-pagos","contacto","quienes-somos-2"]' && pags[2].menu === 'Otra', JSON.stringify(pags));
+
+  // 4. Caché: editar la planilla la borra
+  const conf = hojas.get('Configuración');
+  const filaConf = clave => conf.datos.findIndex(f => f[0] === clave) + 1;
+  hojas.get('Productos').poner(2, 2, 'Nombre cambiado sin onEdit');
+  chequear('sin edición manual, la caché sigue sirviendo lo anterior', respuesta(doGet({ parameter: { accion: 'catalogo' } })).productos[0].nombre === 'Producto de ejemplo 1');
+  editar('Productos', 2, 2, 'Nombre cambiado');
+  chequear('al editar Productos, el cambio se ve en la próxima carga', respuesta(doGet({ parameter: { accion: 'catalogo' } })).productos[0].nombre === 'Nombre cambiado');
+  editar('Configuración', filaConf('mostrar_stock_exacto'), 2, 'sí');
+  chequear('mostrar_stock_exacto = sí → sale la cantidad', respuesta(doGet({ parameter: { accion: 'catalogo' } })).productos[0].cantidad === 12);
+  editar('Configuración', filaConf('mostrar_stock_exacto'), 2, 'no');
+  editar('Configuración', filaConf('mostrar_precios'), 2, 'no');
+  const sinPrecios = respuesta(doGet({ parameter: { accion: 'catalogo' } }));
+  chequear('mostrar_precios = no → no sale ningún precio', sinPrecios.productos.every(p => !('precio' in p)) && sinPrecios.financiacion.length === 0);
+  editar('Configuración', filaConf('mostrar_precios'), 2, 'Sí');
+  editar('Configuración', filaConf('mostrar_sin_stock'), 2, 'no');
+  chequear('mostrar_sin_stock = no → P003 desaparece', !respuesta(doGet({ parameter: { accion: 'catalogo' } })).productos.some(p => p.codigo === 'P003'));
+  editar('Configuración', filaConf('mostrar_sin_stock'), 2, 'sí');
+
+  // 5. Pedidos
+  let r = post({ nombre: 'Robot', telefono: '1', items: [{ codigo: 'P001', cantidad: 1 }], sitio_web: 'http://spam' });
+  chequear('campo trampa lleno → se descarta en silencio (sin mail ni fila)', r.ok && enviados.length === 0 && hojas.get('Pedidos').datos.length === 1);
+  chequear('pedido vacío → error claro', post({ nombre: 'A', telefono: '1', items: [] }).ok === false);
+  chequear('sin teléfono ni mail → error claro', post({ nombre: 'A', items: [{ codigo: 'P001', cantidad: 1 }] }).ok === false);
+
+  orden.length = 0;
+  r = post({ nombre: '<script>alert(1)<\/script> =HYPERLINK("x")', telefono: '+54 9 11 1234-5678', mail: 'cliente@ejemplo.com',
+    pago: 'Transferencia', comentarios: 'Entregar a la tarde', origen: 'instagram',
+    items: [{ codigo: 'P001', cantidad: 2, precio: 1 }, { codigo: 'P004', cantidad: 1 }] });
+  const mail = enviados[enviados.length - 1];
+  const filaPedido = hojas.get('Pedidos').datos[hojas.get('Pedidos').datos.length - 1];
+  const tit = hojas.get('Pedidos').datos[0];
+  const valor = t => filaPedido[tit.indexOf(t)];
+  chequear('pedido válido → ok con número', r.ok && r.pedido === 1, JSON.stringify(r));
+  chequear('el mail sale ANTES de anotar en la planilla', orden[0] === 'mail');
+  chequear('"responder a" = mail del cliente', mail.replyTo === 'cliente@ejemplo.com');
+  chequear('el HTML del mail escapa etiquetas', !mail.htmlBody.includes('<script>') && mail.htmlBody.includes('&lt;script&gt;'));
+  chequear('el precio sale de la planilla, no del navegador (2 × 25.000 + 9.900)', valor('Total contado') === 59900, valor('Total contado'));
+  chequear('texto que empieza con = o + se guarda como texto', String(valor('Teléfono')).startsWith("'+") && valor('Estado') === 'Nuevo');
+  chequear('columna Códigos para el descuento de stock', valor('Códigos') === 'P001×2, P004×1', valor('Códigos'));
+  post({ nombre: 'Opciones', telefono: '1', items: [{ codigo: 'P008', cantidad: 2 }] });
+  const filaOp = hojas.get('Pedidos').datos[hojas.get('Pedidos').datos.length - 1];
+  chequear('un pedido de una opción dice cuál eligió (nombre armado) y su precio', /2 × Producto de ejemplo con opciones \(3\/4" · PPR\) \(P008\) — \$ 8\.400/.test(filaOp[tit.indexOf('Detalle')]), filaOp[tit.indexOf('Detalle')]);
+
+  hojas.get('Pedidos').fallarAlAgregar = true;
+  r = post({ nombre: 'Ana', telefono: '11', items: [{ codigo: 'P001', cantidad: 1 }] });
+  chequear('si falla la planilla, el mail igual sale y responde ok', r.ok && enviados[enviados.length - 1].subject.includes('Ana'));
+  hojas.get('Pedidos').fallarAlAgregar = false;
+  MailApp.fallar = true;
+  r = post({ nombre: 'Beto', telefono: '11', items: [{ codigo: 'P001', cantidad: 1 }] });
+  chequear('si falla el mail (cuota agotada), el pedido queda en la planilla', r.ok && hojas.get('Pedidos').datos.some(f => f.includes('Beto')));
+  MailApp.fallar = false;
+
+  // 6. Descuento automático de stock
+  const filaP = hojas.get('Pedidos').datos.findIndex(f => f.includes('cliente@ejemplo.com')) + 1;
+  const colEstado = tit.indexOf('Estado') + 1;
+  const stockP001 = () => hojas.get('Productos').datos[fila('Productos', 'P001') - 1][5];
+  editar('Pedidos', filaP, colEstado, 'Confirmado');
+  chequear('con descontar = no, confirmar no toca el stock', stockP001() === 12);
+  editar('Configuración', filaConf('descontar_stock_al_confirmar'), 2, 'sí');
+  editar('Pedidos', filaP, colEstado, 'Nuevo');
+  editar('Pedidos', filaP, colEstado, 'Confirmado');
+  chequear('confirmar descuenta (12 − 2 = 10)', stockP001() === 10, stockP001());
+  editar('Pedidos', filaP, colEstado, 'Entregado');
+  editar('Pedidos', filaP, colEstado, 'Confirmado');
+  chequear('confirmar dos veces no descuenta dos veces', stockP001() === 10, stockP001());
+  editar('Pedidos', filaP, colEstado, 'Cancelado');
+  chequear('cancelar devuelve el stock (10 + 2 = 12)', stockP001() === 12, stockP001());
+  chequear('el pedido del formulario queda con Canal = Formulario', valor('Canal') === 'Formulario', valor('Canal'));
+
+  // 7. Pedidos por WhatsApp
+  const mailsAntes = enviados.length;
+  const filasAntes = hojas.get('Pedidos').datos.length;
+  r = post({ tipo: 'whatsapp', ref: 'W-AB12C', origen: 'instagram', items: [{ codigo: 'P004', cantidad: 3 }] });
+  const filaW = hojas.get('Pedidos').datos[hojas.get('Pedidos').datos.length - 1];
+  const vW = t => filaW[tit.indexOf(t)];
+  chequear('WhatsApp: se anota una fila nueva', r.ok && hojas.get('Pedidos').datos.length === filasAntes + 1, JSON.stringify(r));
+  chequear('WhatsApp: no manda mail (no gasta la cuota)', enviados.length === mailsAntes);
+  chequear('WhatsApp: Canal, Referencia, Códigos y total', vW('Canal') === 'WhatsApp' && vW('Referencia') === 'W-AB12C' && vW('Códigos') === 'P004×3' && vW('Total contado') === 29700 && vW('Estado') === 'Nuevo', JSON.stringify(filaW));
+  r = post({ tipo: 'whatsapp', ref: 'W-AB12C', items: [{ codigo: 'P004', cantidad: 3 }] });
+  chequear('WhatsApp: tocar dos veces el botón no duplica la fila', r.repetido === true && hojas.get('Pedidos').datos.length === filasAntes + 1);
+  chequear('WhatsApp: referencia inválida → rechazado', post({ tipo: 'whatsapp', ref: '<script>', items: [{ codigo: 'P001', cantidad: 1 }] }).ok === false);
+  chequear('WhatsApp: pedido vacío → rechazado', post({ tipo: 'whatsapp', ref: 'W-ZZZZ1', items: [] }).ok === false);
+  const filaWp = hojas.get('Pedidos').datos.findIndex(f => f.includes('W-AB12C')) + 1;
+  const stockP004 = () => hojas.get('Productos').datos[fila('Productos', 'P004') - 1][5];
+  editar('Pedidos', filaWp, colEstado, 'Confirmado');
+  chequear('WhatsApp: al confirmarlo también descuenta stock (30 − 3 = 27)', stockP004() === 27, stockP004());
+  let topado = false;
+  for (let i = 0; i < 40; i++) if (post({ tipo: 'whatsapp', ref: 'W-T' + String(i).padStart(4, '0'), items: [{ codigo: 'P001', cantidad: 1 }] }).ok === false) { topado = true; break; }
+  chequear('WhatsApp: hay un tope de registros por minuto', topado);
+
+  // 8. Descripción larga
+  [...memoria.keys()].filter(k => k.startsWith('lim_')).forEach(k => memoria.delete(k)); // pasa el minuto del tope
+  editar('Productos', 2, columnaProductos('Descripción larga'),'Párrafo uno.\nPárrafo dos <b>con etiqueta</b>.');
+  const p1 = respuesta(doGet({ parameter: { accion: 'catalogo' } })).productos.find(p => p.codigo === 'P001');
+  chequear('la descripción larga sale en el catálogo', p1.descripcion_larga === 'Párrafo uno.\nPárrafo dos <b>con etiqueta</b>.', JSON.stringify(p1));
+
+  // 9. Actualizar una planilla armada con la versión anterior (sin Canal, Referencia ni Descripción larga)
+  hojas.delete('Pedidos');
+  const vieja = libro.insertSheet('Pedidos');
+  vieja.datos = [['Fecha', 'N° pedido', 'Nombre', 'Teléfono', 'Mail', 'Detalle', 'Códigos', 'Total contado', 'Forma de pago', 'Comentarios', 'Origen', 'Estado', 'Stock descontado'],
+    ['x', 1, 'Viejo', '', '', '', 'P001×1', 1, '', '', '', 'Nuevo', '']];
+  const prodViejos = hojas.get('Productos');
+  const colLarga = columnaProductos('Descripción larga');
+  prodViejos.datos.forEach(f => f.splice(colLarga - 1, 1));
+  configurarPlanilla();
+  chequear('"Configurar / actualizar" agrega las columnas que faltan, al final', vieja.datos[0].slice(-3).join(',') === 'Canal,Cliente,Referencia' && prodViejos.datos[0].includes('Descripción larga'), libro.ultimoToast);
+  chequear('…sin tocar los datos que ya estaban', vieja.datos[1][2] === 'Viejo' && vieja.datos.length === 2);
+  r = post({ tipo: 'whatsapp', ref: 'W-VIEJA1', items: [{ codigo: 'P001', cantidad: 1 }] });
+  const ultima = vieja.datos[vieja.datos.length - 1];
+  chequear('en la planilla vieja, cada dato cae en su columna', ultima[vieja.datos[0].indexOf('Referencia')] === 'W-VIEJA1' && ultima[vieja.datos[0].indexOf('Estado')] === 'Nuevo', JSON.stringify(ultima));
+
+  // 10. Escalas por cantidad y mayoristas
+  [...memoria.keys()].filter(k => k.startsWith('lim_')).forEach(k => memoria.delete(k));
+  chequear('Configuración suma los datos de mayoristas', ['mayoristas_activo', 'mayorista_monto_minimo', 'mayorista_unidades_minimas', 'direccion_sitio'].every(k => filaConf(k) > 0));
+  const confVieja = hojas.get('Configuración');
+  confVieja.datos = confVieja.datos.filter(f => !['mayorista_monto_minimo', 'direccion_sitio'].includes(f[0]));
+  configurarPlanilla();
+  chequear('a una Configuración vieja se le agregan los datos que faltan, sin tocar el resto', filaConf('direccion_sitio') > 0 && filaConf('mayorista_monto_minimo') > 0 && conf.datos[filaConf('whatsapp') - 1][1] === '5491169484851', libro.ultimoToast);
+
+  let catM = respuesta(doGet({ parameter: { accion: 'catalogo' } }));
+  const p1m = catM.productos.find(p => p.codigo === 'P001');
+  chequear('el catálogo público trae solo las escalas "todos" (P001: −5% desde 6)', JSON.stringify(p1m.escalas) === '[{"desde":6,"descuento":0.05}]', JSON.stringify(p1m.escalas));
+  chequear('las escalas de mayoristas NO salen en el catálogo público (P004 solo tiene escala mayorista → no trae escalas)',
+    !('escalas' in catM.productos.find(p => p.codigo === 'P004')) && catM.productos.every(p => (p.escalas || []).every(t => t.descuento === 0.05)) &&
+    !/monto_minimo|unidades_minimas|mayoristas"\s*:\s*\{/.test(JSON.stringify(catM)) && catM.negocio.mayoristas === true);
+  const esc = hojas.get('Escalas');
+  esc.datos.push(['P004', 'todos', 10, 15]);
+  editar('Escalas', esc.datos.length, 4, 15);
+  chequear('un descuento escrito como 15 (sin %) se entiende como 15%', JSON.stringify(respuesta(doGet({ parameter: { accion: 'catalogo' } })).productos.find(p => p.codigo === 'P004').escalas) === '[{"desde":10,"descuento":0.15}]');
+
+  let ultimaFila = () => hojas.get('Pedidos').datos[hojas.get('Pedidos').datos.length - 1];
+  let col = t => hojas.get('Pedidos').datos[0].indexOf(t);
+  r = post({ nombre: 'Minorista', telefono: '1', items: [{ codigo: 'P001', cantidad: 6 }] });
+  chequear('minorista con 6 u. de P001 → escala "todos": 6 × $23.750 = $142.500', ultimaFila()[col('Total contado')] === 142500 && ultimaFila()[col('Cliente')] === 'Minorista', ultimaFila()[col('Total contado')]);
+  chequear('el detalle muestra precio por unidad y descuento', /23\.750 c\/u \(−5%\)/.test(ultimaFila()[col('Detalle')]), ultimaFila()[col('Detalle')]);
+
+  // Ingreso: sin direccion_sitio no se puede
+  const mailsAntesM = enviados.length;
+  r = post({ tipo: 'mayorista_acceso', nombre: 'Mayo Rista', telefono: '11', mail: 'MAYO@Ejemplo.com', consentimiento: true });
+  chequear('sin direccion_sitio en Configuración → el ingreso avisa y no manda mail', r.ok === false && enviados.length === mailsAntesM, JSON.stringify(r));
+  editar('Configuración', filaConf('direccion_sitio'), 2, 'https://minegocio.netlify.app/');
+  chequear('sin consentimiento → no se registra', post({ tipo: 'mayorista_acceso', nombre: 'A', mail: 'a@ejemplo.com', consentimiento: false }).ok === false);
+  r = post({ tipo: 'mayorista_acceso', nombre: 'Mayo Rista', telefono: '11', mail: 'MAYO@Ejemplo.com', consentimiento: true });
+  const mailAcceso = enviados[enviados.length - 1];
+  const token = (mailAcceso.body.match(/acceso=([a-f0-9]+)/) || [])[1];
+  chequear('pedir acceso → mail al mayorista con un enlace a la dirección del sitio', r.ok && mailAcceso.to === 'mayo@ejemplo.com' && mailAcceso.body.includes('https://minegocio.netlify.app/?acceso=') && !!token, JSON.stringify(r));
+  const filaMay = hojas.get('Mayoristas').datos.find(f => f.includes('mayo@ejemplo.com'));
+  chequear('queda anotado en Mayoristas, con consentimiento y Activo = sí', !!filaMay && /^sí — /.test(filaMay[4]) && filaMay[6] === 'sí', JSON.stringify(filaMay));
+  chequear('el enlace no queda guardado tal cual (solo su resumen)', ![...memoria.keys()].some(k => k.includes(token)));
+
+  const malo = post({ tipo: 'mayorista_validar', token: token.replace(/^./, c => (c === 'a' ? 'b' : 'a')) });
+  chequear('un enlace inventado no sirve', malo.ok === false);
+  const val = post({ tipo: 'mayorista_validar', token });
+  chequear('el enlace verdadero da una sesión', val.ok && typeof val.sesion === 'string' && val.nombre === 'Mayo Rista', JSON.stringify(val));
+  chequear('el enlace sirve una sola vez', post({ tipo: 'mayorista_validar', token }).ok === false);
+
+  const dm = post({ tipo: 'mayorista_datos', sesion: val.sesion });
+  chequear('con la sesión, el script entrega las escalas mayoristas', dm.ok && JSON.stringify(dm.escalas.P001) === '[{"desde":6,"descuento":0.15},{"desde":24,"descuento":0.25}]', JSON.stringify(dm));
+  const [parte, firma] = val.sesion.split('.');
+  const otraParte = Utilities.base64EncodeWebSafe('otro@ejemplo.com|' + (Date.now() + 1e9)).replace(/=+$/, '');
+  chequear('una sesión modificada (otro mail) no sirve', post({ tipo: 'mayorista_datos', sesion: otraParte + '.' + firma }).sesion_invalida === true);
+  chequear('una sesión con la firma cambiada no sirve', post({ tipo: 'mayorista_datos', sesion: parte + '.' + firma.slice(0, -2) + 'xx' }).sesion_invalida === true);
+
+  r = post({ nombre: 'Mayo Rista', telefono: '11', sesion: val.sesion, items: [{ codigo: 'P001', cantidad: 6 }] });
+  chequear('pedido mayorista: 6 × $21.250 (−15%) = $127.500, Cliente = Mayorista', ultimaFila()[col('Total contado')] === 127500 && ultimaFila()[col('Cliente')] === 'Mayorista', ultimaFila()[col('Total contado')] + ' ' + ultimaFila()[col('Cliente')]);
+  chequear('el mail a Pablo dice MAYORISTA y usa el mail verificado para responder', /MAYORISTA/.test(enviados[enviados.length - 1].subject) && enviados[enviados.length - 1].replyTo === 'mayo@ejemplo.com');
+  r = post({ nombre: 'Mayo Rista', telefono: '11', sesion: val.sesion, items: [{ codigo: 'P001', cantidad: 24 }] });
+  chequear('con 24 u. se aplica el tramo más alto (−25%)', ultimaFila()[col('Total contado')] === 24 * 18750, ultimaFila()[col('Total contado')]);
+  r = post({ nombre: 'Falso', telefono: '11', sesion: 'inventada.xxx', items: [{ codigo: 'P001', cantidad: 6 }] });
+  chequear('con una sesión inventada se cobra como minorista', ultimaFila()[col('Total contado')] === 142500 && ultimaFila()[col('Cliente')] === 'Minorista');
+
+  editar('Configuración', filaConf('mayorista_unidades_minimas'), 2, 12);
+  r = post({ nombre: 'Mayo Rista', telefono: '11', sesion: val.sesion, items: [{ codigo: 'P001', cantidad: 6 }, { codigo: 'P004', cantidad: 12 }] });
+  chequear('unidades mínimas 12: P001 (6 u.) va con escala "todos", P004 (12 u.) a mayorista', ultimaFila()[col('Total contado')] === 6 * 23750 + 12 * 7920, ultimaFila()[col('Total contado')] + ' / ' + ultimaFila()[col('Detalle')]);
+  editar('Configuración', filaConf('mayorista_unidades_minimas'), 2, '');
+  editar('Configuración', filaConf('mayorista_monto_minimo'), 2, 200000);
+  r = post({ nombre: 'Mayo Rista', telefono: '11', sesion: val.sesion, items: [{ codigo: 'P001', cantidad: 6 }] });
+  chequear('monto mínimo $200.000 sin alcanzar → todo a precio minorista, Cliente = "Mayorista sin mínimo"', ultimaFila()[col('Total contado')] === 142500 && ultimaFila()[col('Cliente')] === 'Mayorista sin mínimo' && /faltaban \$ 72\.500/.test(ultimaFila()[col('Detalle')]), ultimaFila()[col('Detalle')]);
+  editar('Configuración', filaConf('mayorista_monto_minimo'), 2, '');
+
+  r = post({ tipo: 'whatsapp', ref: 'W-MAYO1', sesion: val.sesion, items: [{ codigo: 'P001', cantidad: 6 }] });
+  chequear('WhatsApp de un mayorista también queda como Mayorista con su mail', ultimaFila()[col('Cliente')] === 'Mayorista' && ultimaFila()[col('Mail')] === 'mayo@ejemplo.com');
+
+  const mayH = hojas.get('Mayoristas');
+  const filaM = mayH.datos.findIndex(f => f.includes('mayo@ejemplo.com')) + 1;
+  mayH.poner(filaM, mayH.datos[0].indexOf('Activo') + 1, 'no');
+  chequear('Activo = no → su sesión deja de servir al instante', post({ tipo: 'mayorista_datos', sesion: val.sesion }).sesion_invalida === true);
+  const mailsBloq = enviados.length;
+  r = post({ tipo: 'mayorista_acceso', nombre: 'Mayo Rista', mail: 'mayo@ejemplo.com', consentimiento: true });
+  chequear('un bloqueado que pide acceso recibe la misma respuesta, pero no le llega mail', r.ok === true && enviados.length === mailsBloq);
+  mayH.poner(filaM, mayH.datos[0].indexOf('Activo') + 1, 'sí');
+  editar('Configuración', filaConf('mayoristas_activo'), 2, 'no');
+  chequear('mayoristas_activo = no → nadie ve precios mayoristas', post({ tipo: 'mayorista_datos', sesion: val.sesion }).sesion_invalida === true && respuesta(doGet({ parameter: { accion: 'catalogo' } })).negocio.mayoristas === false);
+  editar('Configuración', filaConf('mayoristas_activo'), 2, 'sí');
+  let topeMail = false;
+  for (let i = 0; i < 5; i++) if (post({ tipo: 'mayorista_acceso', nombre: 'X', mail: 'repite@ejemplo.com', consentimiento: true }).ok === false) { topeMail = true; break; }
+  chequear('hay un tope de enlaces por mail por hora (cuida los 100 mails diarios)', topeMail);
+
+  // 11. Formulario para cargar productos (funciones del script)
+  const prodF = hojas.get('Productos');
+  const filaProd = c => { const t = prodF.datos[0]; const f = prodF.datos.find(x => x[t.indexOf('Código')] === c); return f && Object.fromEntries(t.map((k, i) => [k, f[i]])); };
+  const fd = formularioDatos();
+  chequear('formulario: trae categorías (con su grande), productos (un grupo cuenta una vez) y un código sugerido libre',
+    fd.categorias.some(c => c.nombre === 'Subcategoría A1' && c.padre === 'Categoría A') && fd.productos.filter(p => p.texto.startsWith('Producto de ejemplo con opciones')).length === 1 &&
+    /^P\d{3}$/.test(fd.siguiente) && !filaProd(fd.siguiente), JSON.stringify(fd.siguiente));
+  const fp = formularioProducto('P008');
+  chequear('formulario: al elegir una opción trae todo el grupo con sus características',
+    fp.conOpciones && fp.nombre === 'Producto de ejemplo con opciones' && fp.variantes.length === 4 &&
+    JSON.stringify(fp.caracteristicas[0]) === '{"nombre":"Medida","valores":["1/2\\"","3/4\\"","1\\""]}' && fp.caracteristicas[1].nombre === 'Material', JSON.stringify(fp.caracteristicas));
+  let rg = formularioGuardar({ nombre: 'Producto del formulario', categoria: 'Categoría Nueva', codigo: 'N1', precio: '12.500', stock: '7', activo: true,
+    descripcion: 'Desc', escalas: [{ para: 'todos', desde: '6', descuento: '5' }], escalasModificadas: true, originales: [] });
+  const n1 = filaProd('N1');
+  chequear('formulario: guarda un producto nuevo (12.500 → 12500) y sale en el catálogo', rg.ok && n1 && n1['Precio contado'] === 12500 && n1['Stock'] === 7 && n1['Activo'] === 'sí' &&
+    respuesta(doGet({ parameter: { accion: 'catalogo' } })).productos.some(p => p.codigo === 'N1'), JSON.stringify(rg));
+  chequear('formulario: una categoría nueva se agrega a Categorías', hojas.get('Categorías').datos.some(f => f[0] === 'Categoría Nueva'));
+  chequear('formulario: guarda su descuento (6 u., 5%) en Escalas', hojas.get('Escalas').datos.some(f => f[0] === 'N1' && f[1] === 'todos' && f[2] === 6 && f[3] === 0.05));
+  rg = formularioGuardar({ nombre: 'Otro', categoria: 'Categoría A', codigo: 'P001', precio: '1', originales: [] });
+  chequear('formulario: no deja usar un código de otro producto', !rg.ok && rg.errores.some(e => /ya lo usa otro/.test(e)), JSON.stringify(rg));
+  rg = formularioGuardar({ nombre: '', categoria: '', codigo: 'a b', precio: '', originales: [] });
+  chequear('formulario: explica qué falta (nombre, categoría, código con espacios, precio)', !rg.ok && rg.errores.length === 4, JSON.stringify(rg.errores));
+  const escP004 = hojas.get('Escalas').datos.filter(f => f[0] === 'P004').length;
+  const grupoEditado = Object.assign({}, formularioProducto('P007'), { escalasModificadas: false });
+  grupoEditado.caracteristicas = ['Medida', 'Material'];
+  grupoEditado.variantes = grupoEditado.variantes.filter(v => v.codigo !== 'P010').map(v => (v.codigo === 'P008' ? Object.assign(v, { precio: 4500 }) : v));
+  grupoEditado.variantes.push({ codigo: 'P007-5', valores: ['1"', 'PP', ''], precio: '5000', stock: '3' });
+  rg = formularioGuardar(grupoEditado);
+  chequear('formulario: editar un grupo cambia precios, agrega opciones y desactiva las que se sacaron',
+    rg.ok && filaProd('P008')['Precio contado'] === 4500 && filaProd('P010')['Activo'] === 'no' && filaProd('P007-5')['Grupo'] === 'Producto de ejemplo con opciones' &&
+    filaProd('P007-5')['Característica 1'] === 'Medida: 1"' && filaProd('P007-5')['Característica 2'] === 'Material: PP' && filaProd('P007-5')['Nombre'] === '', JSON.stringify(rg));
+  chequear('formulario: si no se tocan los descuentos, no se pisan los de la planilla', hojas.get('Escalas').datos.filter(f => f[0] === 'P004').length === escP004);
+  const fp7 = formularioProducto('P007');
+  rg = formularioGuardar(Object.assign({}, fp7, { escalasModificadas: false, caracteristicas: ['Medida:', 'Material :'], variantes: fp7.variantes.filter(v => v.activo) }));
+  chequear('formulario: si el nombre de la característica trae ":" ("Medida:"), se guarda "Medida: 3/4"" y no "Medida:: 3/4""',
+    rg.ok && filaProd('P008')['Característica 1'] === 'Medida: 3/4"' && filaProd('P008')['Característica 2'] === 'Material: PPR' && filaProd('P010')['Activo'] === 'no',
+    JSON.stringify([rg, filaProd('P008')['Característica 1'], filaProd('P008')['Característica 2']]));
+  const n1b = formularioProducto('N1');
+  chequear('formulario: al volver a abrir un producto, trae su descuento como 5 (%)', n1b.escalas.length === 1 && n1b.escalas[0].descuento === 5 && n1b.escalas[0].desde === 6, JSON.stringify(n1b.escalas));
+
+  // 12. El formulario de verdad (la barra lateral), conectado a esta planilla simulada
+  await probarFormulario();
+
+  const resumen = document.createElement('h2');
+  resumen.className = fallas ? 'mal' : 'ok';
+  resumen.textContent = fallas ? `${fallas} prueba(s) fallaron` : 'Todas las pruebas pasaron';
+  document.body.insertBefore(resumen, lista);
+}
+// Abre la barra lateral (HTML_FORMULARIO_) en un marco, con un google.script.run simulado que llama
+// a las funciones reales del script contra la planilla simulada, y la usa como lo haría una persona.
+async function probarFormulario() {
+  const puente = '<script>window.google = { script: { run: (function crear(ok, mal) {' +
+    'var r = { withSuccessHandler: function (f) { return crear(f, mal); }, withFailureHandler: function (f) { return crear(ok, f); } };' +
+    '["formularioDatos", "formularioProducto", "formularioGuardar"].forEach(function (n) { r[n] = function () { var a = JSON.parse(JSON.stringify([].slice.call(arguments)));' +
+    'setTimeout(function () { try { var res = parent[n].apply(null, a); if (ok) ok(JSON.parse(JSON.stringify(res))); } catch (e) { if (mal) mal(e); } }, 20); }; });' +
+    'return r; })() } };<' + '/script>';
+  const marco = document.createElement('iframe');
+  marco.style.cssText = 'width:300px;height:700px;border:1px solid #ccc';
+  marco.title = 'Barra lateral';
+  document.body.appendChild(marco);
+  marco.srcdoc = HTML_FORMULARIO_.replace('<head>', '<head>' + puente);
+  await new Promise(r => marco.addEventListener('load', r, { once: true }));
+  const d = marco.contentDocument, w = marco.contentWindow, $ = id => d.getElementById(id);
+  const esperaF = ms => new Promise(r => setTimeout(r, ms));
+  const hasta = async (c, ms = 3000) => { for (let i = 0; i < ms / 50 && !c(); i++) await esperaF(50); };
+  const fila = c => { const p = hojas.get('Productos'); const t = p.datos[0]; const f = p.datos.find(x => x[t.indexOf('Código')] === c); return f && Object.fromEntries(t.map((k, i) => [k, f[i]])); };
+  const escribir = (el, v) => { el.value = v; el.dispatchEvent(new w.Event('input')); };
+
+  await hasta(() => /productos cargados/.test($('cargando').textContent));
+  chequear('barra lateral: carga la lista de productos y sugiere un código', /productos cargados/.test($('cargando').textContent) && /^P\d{3}$/.test($('codigo').value), $('codigo').value);
+
+  // Producto simple
+  $('guardar').click();
+  await hasta(() => !$('mensaje').classList.contains('oculto'));
+  chequear('barra lateral: guardar vacío explica qué falta', /Falta el nombre/.test($('mensaje').textContent) && /Falta la categoría/.test($('mensaje').textContent), $('mensaje').textContent);
+  escribir($('nombre'), 'Llave de paso');
+  $('categoria').value = '__otra__'; $('categoria').dispatchEvent(new w.Event('change'));
+  chequear('barra lateral: "Otra categoría…" muestra el campo para escribirla y elegir dentro de cuál va', !$('nuevaCategoria').classList.contains('oculto') && $('categoriaPadre').options.length > 1);
+  chequear('barra lateral: las subcategorías aparecen debajo de su grande ("— Subcategoría A1")',
+    [...$('categoria').options].map(o => o.textContent).join('|').includes('Categoría A|— Subcategoría A1'), [...$('categoria').options].map(o => o.textContent).join('|'));
+  escribir($('categoriaNueva'), 'Llaves');
+  $('categoriaPadre').value = 'Categoría B';
+  escribir($('precio'), '8.900'); escribir($('stock'), '4');
+  const codigoSimple = $('codigo').value;
+  $('guardar').click();
+  await hasta(() => /Guardado/.test($('mensaje').textContent));
+  chequear('barra lateral: guarda el producto simple en la planilla', /Guardado: Llave de paso/.test($('mensaje').textContent) && fila(codigoSimple) && fila(codigoSimple)['Precio contado'] === 8900 && fila(codigoSimple)['Categoría'] === 'Llaves', $('mensaje').textContent);
+  const filasCat = hojas.get('Categorías').datos;
+  const iLlaves = filasCat.findIndex(f => f[1] === 'Llaves');
+  chequear('barra lateral: la categoría nueva queda como subcategoría de "Categoría B", en el lugar de la fila que estaba sola',
+    iLlaves > 0 && filasCat[iLlaves][0] === 'Categoría B' && filasCat[iLlaves - 1][0] !== 'Categoría B' && !filasCat.some(f => f[0] === 'Categoría B' && !f[1]), JSON.stringify(filasCat));
+  const arbolB = respuesta(doGet({ parameter: { accion: 'catalogo' } })).arbol.find(n => n.nombre === 'Categoría B');
+  chequear('barra lateral: el sitio recibe "Llaves" dentro de "Categoría B"', arbolB && arbolB.hijas.includes('Llaves'), JSON.stringify(arbolB));
+  await hasta(() => $('nombre').value === '');
+  chequear('barra lateral: después de guardar queda lista para cargar otro, con el código siguiente', $('nombre').value === '' && $('codigo').value !== codigoSimple && /^P\d{3}$/.test($('codigo').value), $('codigo').value);
+
+  // Producto con opciones
+  escribir($('nombre'), 'Codo');
+  $('categoria').value = 'Categoría A';
+  $('conOpciones').click();
+  chequear('barra lateral: "Tiene opciones" cambia precio/stock por la sección de opciones', $('simple').classList.contains('oculto') && !$('opciones').classList.contains('oculto'));
+  const nombres = d.querySelectorAll('.carNombre'), valores = d.querySelectorAll('.carValores');
+  escribir(nombres[0], 'Medida'); escribir(valores[0], '20 mm, 25 mm, 32 mm');
+  escribir(nombres[1], 'Ángulo'); escribir(valores[1], '45°, 90°');
+  escribir($('codigoBase'), 'COD'); escribir($('precioBase'), '1500');
+  $('armar').click();
+  const tarjetas = () => d.querySelectorAll('#variantes .tarjeta');
+  chequear('barra lateral: "Armar combinaciones" arma 3 × 2 = 6 opciones con código y precio base', tarjetas().length === 6 && tarjetas()[0].querySelector('.vCodigo').value === 'COD-1' && tarjetas()[0].querySelector('.vPrecio').value === '1500' && /20 mm · 45°/.test(tarjetas()[0].textContent), tarjetas().length);
+  escribir(tarjetas()[0].querySelector('.vPrecio'), '1700');
+  tarjetas()[5].querySelector('.quitar').click();
+  escribir(valores[0], '20 mm, 25 mm, 32 mm, 40 mm');
+  $('armar').click();
+  chequear('barra lateral: al rearmar, conserva lo editado y suma lo nuevo (8 combinaciones)', tarjetas().length === 8 && tarjetas()[0].querySelector('.vPrecio').value === '1700', tarjetas().length);
+  for (const t of [...tarjetas()].slice(6)) t.querySelector('.quitar').click();
+  $('agregarEscala').click();
+  const esc = d.querySelector('#escalas .tarjeta');
+  esc.querySelector('.ePara').value = 'mayoristas';
+  escribir(esc.querySelector('.eDesde'), '10'); escribir(esc.querySelector('.eDesc'), '15');
+  $('guardar').click();
+  await hasta(() => /Guardado: Codo/.test($('mensaje').textContent));
+  const codos = hojas.get('Productos').datos.filter(f => f[hojas.get('Productos').datos[0].indexOf('Grupo')] === 'Codo');
+  chequear('barra lateral: guarda 6 filas con el mismo Grupo, sus características y precios', /6 opciones/.test($('mensaje').textContent) && codos.length === 6 && fila('COD-1')['Precio contado'] === 1700 && fila('COD-1')['Característica 2'] === 'Ángulo: 45°', $('mensaje').textContent);
+  chequear('barra lateral: el descuento mayorista queda para las 6 opciones', hojas.get('Escalas').datos.filter(f => /^COD-/.test(f[0]) && f[1] === 'mayoristas' && f[3] === 0.15).length === 6);
+  const catCodo = respuesta(doGet({ parameter: { accion: 'catalogo' } })).productos.filter(p => p.grupo === 'Codo');
+  chequear('barra lateral: el sitio recibe el Codo con sus 6 opciones', catCodo.length === 6 && catCodo[0].nombre === 'Codo (20 mm · 45°)', catCodo[0] && catCodo[0].nombre);
+
+  // Editar
+  $('elegir').value = 'COD-1'; $('elegir').dispatchEvent(new w.Event('change'));
+  await hasta(() => $('nombre').value === 'Codo');
+  chequear('barra lateral: elegir un producto carga todos sus datos para editar', $('nombre').value === 'Codo' && tarjetas().length === 6 && d.querySelectorAll('#escalas .tarjeta').length === 1 && valores[1].value === '45°, 90°');
+  escribir(tarjetas()[1].querySelector('.vStock'), '9');
+  $('guardar').click();
+  await hasta(() => fila('COD-2')['Stock'] === 9);
+  chequear('barra lateral: guardar una edición actualiza la fila (no duplica)', fila('COD-2')['Stock'] === 9 && hojas.get('Productos').datos.filter(f => f[0] === 'COD-2').length === 1);
+  marco.dataset.listo = '1';
+}
+
+correr().catch(err => { chequear('error inesperado', false, err.stack); });
+</script>
+</body>
+</html>
