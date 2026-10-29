@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="es-AR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Propuesta de cabecera Corbán</title>
+<!-- Maqueta para elegir. Se abre con el servidor local (no con doble clic): http://localhost:8765/propuestas/barra-superior.html -->
+<style>
+  @font-face { font-family: "Montserrat"; src: url("../sitio/fuentes/montserrat.woff2") format("woff2"); font-weight: 100 900; }
+  :root { --azul: #1747a6; --azul-oscuro: #10347d; --azul-claro: #eef3fc; --borde: #d9dee7; }
+  body { margin: 0; background: #f4f6fa; font: 15px/1.5 "Montserrat", system-ui, sans-serif; color: #1b1f27; }
+  .intro { max-width: 1120px; margin: 24px auto 8px; padding: 0 16px; }
+  .intro h1 { color: var(--azul); font-size: 1.4rem; margin: 0 0 4px; }
+  .opcion { max-width: 1120px; margin: 24px auto; padding: 0 16px; }
+  .opcion h2 { font-size: 1.05rem; margin: 0 0 4px; color: var(--azul); }
+  .opcion p.nota { margin: 0 0 10px; color: #5f6673; font-size: .9rem; }
+  .marco { border: 1px solid var(--borde); border-radius: 12px; overflow: hidden; background: #fff; box-shadow: 0 2px 10px rgba(16,52,125,.08); }
+  .cab { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 20px; min-height: 76px; }
+  .logo { width: 200px; height: 64px; -webkit-mask: url("../sitio/logo.svg") left center / contain no-repeat; mask: url("../sitio/logo.svg") left center / contain no-repeat; }
+  .menu { display: flex; gap: 6px; font-weight: 600; font-size: .9rem; }
+  .menu span { padding: 6px 10px; border-radius: 8px; }
+  .pedido { border-radius: 999px; padding: 8px 16px; font-weight: 700; border: 0; }
+  .aviso { text-align: center; padding: 8px 16px; font-weight: 600; font-size: .9rem; }
+  .cuerpo { padding: 18px 20px 22px; }
+  .cuerpo h3 { margin: 0 0 12px; color: var(--azul); font-size: 1.4rem; }
+  .grilla { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
+  .tarjeta { border: 1px solid var(--borde); border-radius: 10px; overflow: hidden; }
+  .tarjeta img { width: 100%; aspect-ratio: 1; object-fit: cover; display: block; background: var(--azul-claro); }
+  .tarjeta div { padding: 8px 10px; font-size: .85rem; font-weight: 600; }
+  .tarjeta button { margin: 0 10px 10px; width: calc(100% - 20px); min-height: 38px; border-radius: 8px; border: 0; background: var(--azul); color: #fff; font-weight: 700; }
+
+  /* A. Actual */
+  .a .cab { background: var(--azul); color: #fff; }
+  .a .logo { background: #fff; }
+  .a .pedido { background: #fff; color: var(--azul); }
+  .a .aviso { background: var(--azul-claro); color: var(--azul); }
+
+  /* B. Blanco con logo azul y franja azul */
+  .b .cab { background: #fff; color: var(--azul); border-bottom: 1px solid var(--borde); }
+  .b .logo { background: var(--azul); }
+  .b .pedido { background: var(--azul); color: #fff; }
+  .b .aviso { background: var(--azul); color: #fff; }
+
+  /* C. Degradé de blanco a celeste, franja azul */
+  .c .cab { background: linear-gradient(90deg, #ffffff 0%, #ffffff 35%, #dbe6fa 100%); color: var(--azul); }
+  .c .logo { background: var(--azul); }
+  .c .pedido { background: var(--azul); color: #fff; }
+  .c .aviso { background: linear-gradient(90deg, var(--azul-oscuro), var(--azul)); color: #fff; }
+
+  /* D. Blanco con línea de marca y franja celeste */
+  .d .cab { background: #fff; color: var(--azul); border-bottom: 4px solid var(--azul); }
+  .d .logo { background: var(--azul); }
+  .d .pedido { background: var(--azul); color: #fff; }
+  .d .aviso { background: var(--azul-claro); color: var(--azul); }
+
+  @media (max-width: 640px) { .menu { display: none; } .logo { width: 150px; height: 52px; } }
+</style>
+</head>
+<body>
+<div class="intro">
+  <h1>Propuestas para la cabecera de corban.com.ar</h1>
+  <p>Cuatro opciones con el logo real, la franja de avisos y tarjetas con fotos reales. La A es como está hoy. Los colores del resto del sitio (títulos, botones) se mantienen en el mismo azul.</p>
+</div>
+
+<script>
+  const productos = [['TF2020', 'Tubo Fusión PN20 Agua F/C'], ['LLPC20', 'Llave de Paso Fusión Clásica'], ['CH2012', 'Codo Inserto Hembra'], ['VTFP20', 'Válvula Esférica FF Manij.Plást.']];
+  const opciones = [
+    ['a', 'A. Como está hoy', 'Cabecera azul con el logo en blanco.'],
+    ['b', 'B. Blanca con logo azul (recomendada)', 'La cabecera blanca da protagonismo al logo y a las fotos; la franja de avisos en azul marca la identidad y se lee bien (contraste alto).'],
+    ['c', 'C. Degradé de blanco a celeste', 'El logo azul queda sobre blanco y el degradé termina en celeste suave; la franja usa un degradé de azul oscuro a azul.'],
+    ['d', 'D. Blanca con línea azul', 'Igual que la B pero con una línea azul de marca bajo la cabecera y la franja de avisos en celeste, más liviana.'],
+  ];
+  for (const [clase, titulo, nota] of opciones) {
+    document.write(`<section class="opcion ${clase}"><h2>${titulo}</h2><p class="nota">${nota}</p><div class="marco">
+      <div class="cab"><div class="logo" role="img" aria-label="Corbán"></div>
+        <nav class="menu"><span>Quiénes somos</span><span>Envíos y pagos</span><span>Preguntas frecuentes</span><span>Contacto</span></nav>
+        <button class="pedido">Tu pedido 0</button></div>
+      <p class="aviso">Solicitá cotización y te responderemos a la brevedad</p>
+      <div class="cuerpo"><h3>Catálogo</h3><div class="grilla">
+        ${productos.map(([c, n]) => `<div class="tarjeta"><img src="../sitio/fotos/${c}.webp" onerror="this.src='https://corban.com.ar/fotos/${c}.webp'" alt="${n}"><div>${n}</div><button>Elegir medida</button></div>`).join('')}
+      </div></div></div></section>`);
+  }
+</script>
+</body>
+</html>
